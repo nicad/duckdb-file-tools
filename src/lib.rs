@@ -3,7 +3,7 @@ extern crate duckdb_loadable_macros;
 extern crate libduckdb_sys;
 
 use duckdb::{
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
+    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId, ListVector},
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, arrow::WritableVector},
     vscalar::{VScalar, ScalarFunctionSignature},
     Connection, Result,
@@ -413,23 +413,46 @@ impl VScalar for PathPartsScalar {
         let name_vector = struct_vector.child(4, input.len());            // name: VARCHAR
         let stem_vector = struct_vector.child(5, input.len());            // stem: VARCHAR
         let suffix_vector = struct_vector.child(6, input.len());          // suffix: VARCHAR
-        let suffixes_vector = struct_vector.child(7, input.len());        // suffixes: LIST<VARCHAR>
-        let parts_vector = struct_vector.child(8, input.len());           // parts: LIST<VARCHAR>
+        let mut suffixes_list_vector = struct_vector.list_vector_child(7);  // suffixes: LIST<VARCHAR>
+        let mut parts_list_vector = struct_vector.list_vector_child(8);     // parts: LIST<VARCHAR>
         let mut is_absolute_vector = struct_vector.child(9, input.len()); // is_absolute: BOOLEAN
         
         // Get raw data slice for boolean field
         let is_absolute_data = is_absolute_vector.as_mut_slice::<bool>();
         
+        // First pass: collect all parsed components
+        let mut all_components = Vec::new();
+        let mut total_suffixes = 0;
+        let mut total_parts = 0;
+        
         for i in 0..input.len() {
             let mut path_duck_string = input_data[i];
             let path_str = DuckString::new(&mut path_duck_string).as_str();
             
-            // Handle path parsing with error handling:
-            // - truly invalid input -> return NULL
-            // - valid paths (including empty) -> return parsed components
             match parse_path_components(&path_str) {
                 Ok(components) => {
-                    // Set all fields in the struct
+                    total_suffixes += components.suffixes.len();
+                    total_parts += components.parts.len();
+                    all_components.push(Some(components));
+                }
+                Err(_) => {
+                    all_components.push(None);
+                }
+            }
+        }
+        
+        // Get child vectors for LIST fields with proper capacity
+        let suffixes_child_vector = suffixes_list_vector.child(total_suffixes);
+        let parts_child_vector = parts_list_vector.child(total_parts);
+        
+        // Second pass: populate all vectors
+        let mut suffixes_offset = 0;
+        let mut parts_offset = 0;
+        
+        for (i, components_opt) in all_components.iter().enumerate() {
+            match components_opt {
+                Some(components) => {
+                    // Set scalar fields
                     drive_vector.insert(i, components.drive.as_str());
                     root_vector.insert(i, components.root.as_str());
                     anchor_vector.insert(i, components.anchor.as_str());
@@ -437,25 +460,42 @@ impl VScalar for PathPartsScalar {
                     name_vector.insert(i, components.name.as_str());
                     stem_vector.insert(i, components.stem.as_str());
                     suffix_vector.insert(i, components.suffix.as_str());
-                    
-                    // TODO: Handle LIST fields (suffixes, parts)
-                    // For now, insert empty strings as placeholder
-                    suffixes_vector.insert(i, "[]"); // JSON-like representation for now
-                    parts_vector.insert(i, "[]");
-                    
                     is_absolute_data[i] = components.is_absolute;
+                    
+                    // Populate suffixes LIST
+                    for (j, suffix) in components.suffixes.iter().enumerate() {
+                        suffixes_child_vector.insert(suffixes_offset + j, suffix.as_str());
+                    }
+                    suffixes_list_vector.set_entry(i, suffixes_offset, components.suffixes.len());
+                    suffixes_offset += components.suffixes.len();
+                    
+                    // Populate parts LIST
+                    for (j, part) in components.parts.iter().enumerate() {
+                        parts_child_vector.insert(parts_offset + j, part.as_str());
+                    }
+                    parts_list_vector.set_entry(i, parts_offset, components.parts.len());
+                    parts_offset += components.parts.len();
                 }
-                Err(_) => {
+                None => {
                     // Set entire struct row as NULL for truly invalid input
                     struct_vector.set_null(i);
                 }
             }
         }
         
+        // Set total lengths for LIST vectors
+        suffixes_list_vector.set_len(total_suffixes);
+        parts_list_vector.set_len(total_parts);
+        
         Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
+        // Create LIST<VARCHAR> type for suffixes and parts
+        let varchar_type = LogicalTypeHandle::from(LogicalTypeId::Varchar);
+        let list_varchar_type_1 = LogicalTypeHandle::list(&varchar_type);
+        let list_varchar_type_2 = LogicalTypeHandle::list(&varchar_type);
+        
         // Create STRUCT return type with named fields
         let struct_type = LogicalTypeHandle::struct_type(&[
             ("drive", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
@@ -465,8 +505,8 @@ impl VScalar for PathPartsScalar {
             ("name", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
             ("stem", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
             ("suffix", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-            ("suffixes", LogicalTypeHandle::from(LogicalTypeId::Varchar)), // TODO: LIST<VARCHAR>
-            ("parts", LogicalTypeHandle::from(LogicalTypeId::Varchar)),    // TODO: LIST<VARCHAR>
+            ("suffixes", list_varchar_type_1),
+            ("parts", list_varchar_type_2),
             ("is_absolute", LogicalTypeHandle::from(LogicalTypeId::Boolean)),
         ]);
         
@@ -898,6 +938,8 @@ mod tests {
         let components = result.unwrap();
         assert_eq!(components.name, "file.txt");
         assert_eq!(components.suffix, ".txt");
+        assert_eq!(components.suffixes, vec![".txt"]);
+        assert_eq!(components.parts, vec!["home", "user", "file.txt"]);
         assert_eq!(components.root, "/");
         assert!(components.is_absolute);
         
