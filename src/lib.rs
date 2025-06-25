@@ -16,6 +16,7 @@ use std::{
     error::Error,
     ffi::CString,
     fs,
+    io::Read,
     path::Path,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::SystemTime,
@@ -41,7 +42,6 @@ struct FileMetadata {
 #[repr(C)]
 struct GlobStatBindData {
     pattern: String,
-    hash_algorithm: Option<String>,
     files: Vec<FileMetadata>,
 }
 
@@ -67,23 +67,14 @@ impl VTab for GlobStatVTab {
         bind.add_result_column("is_file", LogicalTypeHandle::from(LogicalTypeId::Varchar));
         bind.add_result_column("is_dir", LogicalTypeHandle::from(LogicalTypeId::Varchar));
         bind.add_result_column("is_symlink", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("hash", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
         let pattern = bind.get_parameter(0).to_string();
-        
-        let hash_algorithm = if bind.get_parameter_count() > 1 {
-            // For now, just ignore the second parameter to avoid NULL handling issues
-            None
-        } else {
-            None
-        };
 
-        // Use DuckDB's built-in glob function for pattern matching
-        let files = collect_files_with_duckdb_glob(&pattern, hash_algorithm.as_deref())?;
+        // Use DuckDB's built-in glob function for pattern matching (no hash computation)
+        let files = collect_files_with_duckdb_glob(&pattern)?;
 
         Ok(GlobStatBindData {
             pattern,
-            hash_algorithm,
             files,
         })
     }
@@ -136,13 +127,6 @@ impl VTab for GlobStatVTab {
         
         let is_symlink_str = CString::new(file_meta.is_symlink.to_string())?;
         output.flat_vector(9).insert(0, is_symlink_str);
-        
-        if let Some(ref hash) = file_meta.hash {
-            let hash_str = CString::new(hash.clone())?;
-            output.flat_vector(10).insert(0, hash_str);
-        } else {
-            output.flat_vector(10).set_null(0);
-        }
 
         output.set_len(1);
         init_data.current_index.store(current_idx + 1, Ordering::Relaxed);
@@ -153,7 +137,6 @@ impl VTab for GlobStatVTab {
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![
             LogicalTypeHandle::from(LogicalTypeId::Varchar), // pattern
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // hash (optional)
         ])
     }
 }
@@ -236,10 +219,7 @@ impl VTab for FilePathSha256VTab {
     }
 }
 
-fn collect_files_with_duckdb_glob(
-    pattern: &str, 
-    hash_algorithm: Option<&str>
-) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
+fn collect_files_with_duckdb_glob(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let mut results = Vec::new();
     
     // Use the glob crate for pattern matching (same as DuckDB's glob implementation)
@@ -248,12 +228,6 @@ fn collect_files_with_duckdb_glob(
         
         // Skip if it's not a file (directories, symlinks, etc. can be included based on metadata)
         let metadata = fs::metadata(&path)?;
-        
-        let hash = if hash_algorithm.is_some() && metadata.is_file() {
-            Some(compute_file_hash(&path)?)
-        } else {
-            None
-        };
         
         let file_meta = FileMetadata {
             path: path.to_string_lossy().to_string(),
@@ -266,7 +240,7 @@ fn collect_files_with_duckdb_glob(
             is_file: metadata.is_file(),
             is_dir: metadata.is_dir(),
             is_symlink: metadata.file_type().is_symlink(),
-            hash,
+            hash: None, // No hash computation in glob_stat
         };
         
         results.push(file_meta);
@@ -367,6 +341,74 @@ impl VScalar for FileStatScalar {
     }
 }
 
+// Scalar file_sha256 function - returns SHA256 hash as lowercase hex string
+struct FileSha256Scalar;
+
+impl VScalar for FileSha256Scalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let input_vector = input.flat_vector(0);
+        let input_data = input_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        let mut output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut filename_duck_string = input_data[i];
+            let filename = DuckString::new(&mut filename_duck_string).as_str();
+            
+            // Handle file hashing with error handling as specified:
+            // - file doesn't exist -> return NULL
+            // - permission error -> return NULL
+            // - other errors -> return error
+            match compute_file_sha256(&filename) {
+                Ok(Some(hash_str)) => {
+                    output_vector.insert(i, hash_str.as_str());
+                }
+                Ok(None) => {
+                    output_vector.set_null(i);
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        )]
+    }
+}
+
+fn compute_file_sha256(filename: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let path = Path::new(filename);
+    
+    match compute_file_hash_streaming(path) {
+        Ok(hash) => Ok(Some(hash)),
+        Err(e) => {
+            use std::io::ErrorKind;
+            if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
+                match io_error.kind() {
+                    ErrorKind::NotFound => Ok(None), // File doesn't exist -> return NULL
+                    ErrorKind::PermissionDenied => Ok(None), // Permission error -> return NULL
+                    _ => Err(e), // Other errors -> return error
+                }
+            } else {
+                Err(e) // Non-IO errors -> return error
+            }
+        }
+    }
+}
+
 fn get_file_metadata_struct(filename: &str) -> Result<Option<FileMetadata>, Box<dyn std::error::Error>> {
     let path = Path::new(filename);
     
@@ -430,6 +472,37 @@ fn get_file_metadata_json(filename: &str) -> Result<Option<String>, Box<dyn std:
     }
 }
 
+// Streaming SHA256 computation with adaptive chunk sizes
+fn compute_file_hash_streaming(path: &Path) -> Result<String, Box<dyn Error>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    
+    // Adaptive chunk strategy: 1MB -> 2MB -> 4MB -> 8MB max
+    let mut chunk_size = 1024 * 1024; // Start with 1MB
+    const MAX_CHUNK_SIZE: usize = 8 * 1024 * 1024; // Max 8MB
+    
+    loop {
+        let mut buffer = vec![0u8; chunk_size];
+        let bytes_read = file.read(&mut buffer)?;
+        
+        if bytes_read == 0 {
+            break; // EOF
+        }
+        
+        // Update hasher with the data we actually read
+        hasher.update(&buffer[..bytes_read]);
+        
+        // Double chunk size for next read (up to max)
+        if chunk_size < MAX_CHUNK_SIZE {
+            chunk_size = std::cmp::min(chunk_size * 2, MAX_CHUNK_SIZE);
+        }
+    }
+    
+    let result = hasher.finalize();
+    Ok(format!("{:x}", result))
+}
+
+// Legacy function kept for compatibility (not used anymore)
 fn compute_file_hash(path: &Path) -> Result<String, Box<dyn Error>> {
     let contents = fs::read(path)?;
     let mut hasher = Sha256::new();
@@ -485,6 +558,9 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_scalar_function::<FileStatScalar>("file_stat")
         .expect("Failed to register file_stat scalar function");
     
+    con.register_scalar_function::<FileSha256Scalar>("file_sha256")
+        .expect("Failed to register file_sha256 scalar function");
+    
     Ok(())
 }
 
@@ -499,8 +575,8 @@ mod tests {
         let pattern1 = "src/*.rs";
         let pattern2 = "Cargo.*";
         
-        let files1 = collect_files_with_duckdb_glob(pattern1, None).unwrap_or_default();
-        let files2 = collect_files_with_duckdb_glob(pattern2, None).unwrap_or_default();
+        let files1 = collect_files_with_duckdb_glob(pattern1).unwrap_or_default();
+        let files2 = collect_files_with_duckdb_glob(pattern2).unwrap_or_default();
         
         // Extract just the file paths for comparison
         let paths1: HashSet<_> = files1.iter().map(|f| &f.path).collect();
@@ -542,6 +618,30 @@ mod tests {
         
         // Test non-existent file
         let result = get_file_metadata_json("nonexistent_file.txt");
+        assert!(result.is_ok(), "Should handle non-existent file gracefully");
+        assert!(result.unwrap().is_none(), "Should return None for non-existent file");
+    }
+
+    #[test]
+    fn test_streaming_file_hash() {
+        // Test streaming hash computation
+        let result = compute_file_hash_streaming(Path::new("Cargo.toml"));
+        assert!(result.is_ok(), "Should successfully compute hash for existing file");
+        
+        let hash = result.unwrap();
+        assert_eq!(hash.len(), 64, "SHA256 hash should be 64 characters long");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), 
+                "Hash should contain only hex digits");
+        assert!(hash.chars().all(|c| !c.is_uppercase()), 
+                "Hash should be lowercase");
+        
+        // Test file_sha256 helper function
+        let result = compute_file_sha256("Cargo.toml");
+        assert!(result.is_ok(), "Should successfully process existing file");
+        assert!(result.unwrap().is_some(), "Should return Some for existing file");
+        
+        // Test non-existent file
+        let result = compute_file_sha256("nonexistent_file.txt");
         assert!(result.is_ok(), "Should handle non-existent file gracefully");
         assert!(result.unwrap().is_none(), "Should return None for non-existent file");
     }

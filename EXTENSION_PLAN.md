@@ -25,7 +25,7 @@
 
 ### glob_stat() Function Signature
 ```sql
-glob_stat(pattern TEXT, hash TEXT DEFAULT NULL) 
+glob_stat(pattern TEXT)
 → TABLE(
     path TEXT,
     size BIGINT,
@@ -36,8 +36,7 @@ glob_stat(pattern TEXT, hash TEXT DEFAULT NULL)
     inode BIGINT,
     is_file BOOLEAN,
     is_dir BOOLEAN,
-    is_symlink BOOLEAN,
-    hash TEXT  -- NULL if hash parameter is NULL
+    is_symlink BOOLEAN
 )
 ```
 
@@ -45,7 +44,6 @@ This is a table function.
 
 ### Parameters
 - `pattern` (TEXT): File glob pattern (e.g., `*.txt`, `**/*.rs`)
-- `hash` (TEXT, optional): Hash algorithm (`NULL` or `'sha256'`)
 
 ### Usage Examples
 ```sql
@@ -53,7 +51,7 @@ This is a table function.
 SELECT * FROM glob_stat('/home/user/**/*.log');
 
 -- Include SHA256 hashes
-SELECT path, size, hash FROM glob_stat('/data/*.csv', hash='sha256');
+SELECT path, size, hash FROM glob_stat('/data/*.csv');
 
 -- Filter by file size and modification time
 SELECT path, size, modified_time 
@@ -100,12 +98,12 @@ SELECT filename FROM glob('*') WHERE file_stat(filename).size > 1000;
 SELECT filename FROM glob('*') ORDER BY file_stat(filename).modified_time DESC;
 ```
 
-### file_sha256_digest() Function signature
+### file_sha256() Function signature
 
 Most important is to stream the file content by chunks to avoid reading all of it and keep memory usage good while using this function.
 
 ```sql
-file_sha256_digest(filename TEXT)
+file_sha256(filename TEXT)
 → TEXT
 ```
 
@@ -117,10 +115,10 @@ This is a scalar function only.
 ### Usage Examples
 ```sql
 -- most basic
-SELECT file_sha256_digest(".gitignore");
+SELECT file_sha256(".gitignore");
 
 -- Basic file listing with metadata
-SELECT filename, file_sha256_digest(filename) FROM glob('/home/user/**/*.log');
+SELECT filename, file_sha256(filename) FROM glob('/home/user/**/*.log');
 ```
 
 ### file_path_parts() Function signature
@@ -174,19 +172,22 @@ SELECT filename FROM glob('/home/user/**/*.log') WHERE file_path_parts(filename)
 3. DuckDB table function registration
 4. Error handling and edge cases
 
-#### Phase 2: Hashing Support
+#### Phase 3: Hashing Support
+1. implement file_stat
+
+#### Phase 3: Hashing Support
 1. SHA256 implementation for file contents
 2. Streaming hash computation for large files
 3. Performance optimization for hash operations
 
-#### Phase 3: Add extra arguments and other similar utility functions
+#### Phase 4: Add extra arguments and other similar utility functions
 1. exclude pattern: skip files matching a glob, for example `'.git/**'` would skip all git repos
 2. ignore_case true/false for file name matching, for example `'*.csv'` would match .csv or .CSV
 3. `read_file_text(pathname VARCHAR) VARCHAR` and `read_file_binary(pathname VARCHAR) BLOB` scalar functions that given a name returns its content
 4. `permission_errors` optional argument can be 'ignore', 'print', 'fail' (default is 'ignore') - note: scalar functions like read_file_text/read_file_binary should error on permission issues
 5. `symlink` optional argument can be 'follow', 'skip' (default is 'skip') - follow will include loop detection when implemented
 
-#### Phase 4: Age Encryption Integration
+#### Phase 5: Age Encryption Integration
 1. File encryption/decryption functions
 2. Integration with rage library
 3. Secure key handling using duckdb secret store
