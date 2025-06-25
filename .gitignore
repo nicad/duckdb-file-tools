@@ -45,3 +45,6 @@ venv.bak/
 
 # Test data (optional - uncomment if you don't want to track test files)
 # /test_data/
+
+# Links to other code bases
+/docs/other-extensions/

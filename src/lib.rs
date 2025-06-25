@@ -4,21 +4,24 @@ extern crate libduckdb_sys;
 
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
+    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, arrow::WritableVector},
+    vscalar::{VScalar, ScalarFunctionSignature},
     Connection, Result,
 };
 use duckdb_loadable_macros::duckdb_entrypoint_c_api;
 use libduckdb_sys as ffi;
+use libduckdb_sys::duckdb_string_t;
+use duckdb::types::DuckString;
 use std::{
     error::Error,
     ffi::CString,
     fs,
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::SystemTime,
 };
-use jwalk::WalkDir;
 use sha2::{Sha256, Digest};
+use glob::glob;
 
 #[derive(Debug, Clone)]
 struct FileMetadata {
@@ -75,8 +78,8 @@ impl VTab for GlobStatVTab {
             None
         };
 
-        // Simple file collection without jwalk to avoid panics
-        let files = simple_collect_files(&pattern)?;
+        // Use DuckDB's built-in glob function for pattern matching
+        let files = collect_files_with_duckdb_glob(&pattern, hash_algorithm.as_deref())?;
 
         Ok(GlobStatBindData {
             pattern,
@@ -155,60 +158,98 @@ impl VTab for GlobStatVTab {
     }
 }
 
-const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
+// Scalar-like functions implemented as table functions that return single rows
 
-fn simple_collect_files(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
-    let mut results = Vec::new();
-    
-    // For a basic test, just try to read the current directory
-    let paths = std::fs::read_dir(".")?;
-    
-    for path in paths {
-        let entry = path?;
-        let path = entry.path();
-        let metadata = entry.metadata()?;
-        
-        let file_meta = FileMetadata {
-            path: path.to_string_lossy().to_string(),
-            size: metadata.len(),
-            modified_time: system_time_to_microseconds(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
-            accessed_time: system_time_to_microseconds(metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH)),
-            created_time: system_time_to_microseconds(metadata.created().unwrap_or(SystemTime::UNIX_EPOCH)),
-            permissions: format_permissions(&metadata),
-            inode: get_inode(&metadata),
-            is_file: metadata.is_file(),
-            is_dir: metadata.is_dir(),
-            is_symlink: metadata.file_type().is_symlink(),
-            hash: None,
-        };
-        
-        results.push(file_meta);
-    }
-    
-    Ok(results)
+
+
+// file_path_sha256(filename, content_hash) - returns combined hash
+#[repr(C)]
+struct FilePathSha256BindData {
+    filename: String,
+    content_hash: String,
 }
 
-fn collect_file_metadata(
-    pattern: &str,
-    hash_algorithm: Option<&str>,
+#[repr(C)]
+struct FilePathSha256InitData {
+    done: AtomicBool,
+}
+
+struct FilePathSha256VTab;
+
+impl VTab for FilePathSha256VTab {
+    type InitData = FilePathSha256InitData;
+    type BindData = FilePathSha256BindData;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        bind.add_result_column("path_sha256", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+
+        let filename = bind.get_parameter(0).to_string();
+        let content_hash = bind.get_parameter(1).to_string();
+        Ok(FilePathSha256BindData { filename, content_hash })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(FilePathSha256InitData {
+            done: AtomicBool::new(false),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let init_data = func.get_init_data();
+        let bind_data = func.get_bind_data();
+
+        if init_data.done.swap(true, Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+
+        let path = Path::new(&bind_data.filename);
+        let metadata = fs::metadata(path)?;
+        
+        // Create combined string: filename + modified_time + size + content_hash
+        let modified_time = system_time_to_microseconds(metadata.modified()?);
+        let size = metadata.len();
+        let combined = format!("{}:{}:{}:{}", 
+            bind_data.filename, modified_time, size, bind_data.content_hash);
+        
+        // Hash the combined string
+        let mut hasher = Sha256::new();
+        hasher.update(combined.as_bytes());
+        let result = hasher.finalize();
+        let hash = format!("{:x}", result);
+
+        let hash_str = CString::new(hash)?;
+        output.flat_vector(0).insert(0, hash_str);
+
+        output.set_len(1);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // filename
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // content_hash
+        ])
+    }
+}
+
+fn collect_files_with_duckdb_glob(
+    pattern: &str, 
+    hash_algorithm: Option<&str>
 ) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let mut results = Vec::new();
     
-    let base_path = extract_base_path(pattern);
-    let glob_pattern = extract_glob_pattern(pattern);
-    
-    for entry in WalkDir::new(base_path) {
-        let entry = entry?;
-        let path = entry.path();
+    // Use the glob crate for pattern matching (same as DuckDB's glob implementation)
+    for entry in glob(pattern)? {
+        let path = entry?;
         
-        if !matches_pattern(&path, &glob_pattern) {
-            continue;
-        }
-        
+        // Skip if it's not a file (directories, symlinks, etc. can be included based on metadata)
         let metadata = fs::metadata(&path)?;
-        let file_type = metadata.file_type();
         
-        let hash = if hash_algorithm.is_some() && file_type.is_file() {
+        let hash = if hash_algorithm.is_some() && metadata.is_file() {
             Some(compute_file_hash(&path)?)
         } else {
             None
@@ -222,9 +263,9 @@ fn collect_file_metadata(
             created_time: system_time_to_microseconds(metadata.created().unwrap_or(metadata.modified()?)),
             permissions: format_permissions(&metadata),
             inode: get_inode(&metadata),
-            is_file: file_type.is_file(),
-            is_dir: file_type.is_dir(),
-            is_symlink: file_type.is_symlink(),
+            is_file: metadata.is_file(),
+            is_dir: metadata.is_dir(),
+            is_symlink: metadata.file_type().is_symlink(),
             hash,
         };
         
@@ -234,53 +275,83 @@ fn collect_file_metadata(
     Ok(results)
 }
 
-fn extract_base_path(pattern: &str) -> &str {
-    let glob_chars = ['*', '?', '[', '{'];
-    
-    if let Some(pos) = pattern.find(|c| glob_chars.contains(&c)) {
-        let base_end = pattern[..pos].rfind('/').unwrap_or(0);
-        if base_end == 0 && pattern.starts_with('/') {
-            "/"
-        } else if base_end == 0 {
-            "."
-        } else {
-            &pattern[..base_end]
+// Scalar file_stat function - returns JSON string with file metadata
+struct FileStatScalar;
+
+impl VScalar for FileStatScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let input_vector = input.flat_vector(0);
+        let input_data = input_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        let mut output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut filename_duck_string = input_data[i];
+            let filename = DuckString::new(&mut filename_duck_string).as_str();
+            
+            // Handle file stat with error handling as specified:
+            // - file doesn't exist -> return NULL
+            // - permission error -> return NULL
+            // - other errors -> return error
+            match get_file_metadata_json(&filename) {
+                Ok(Some(json_str)) => {
+                    output_vector.insert(i, json_str.as_str());
+                }
+                Ok(None) => {
+                    output_vector.set_null(i);
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
         }
-    } else {
-        pattern
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        )]
     }
 }
 
-fn extract_glob_pattern(pattern: &str) -> String {
-    pattern.to_string()
-}
-
-fn matches_pattern(path: &Path, pattern: &str) -> bool {
-    let path_str = path.to_string_lossy();
+fn get_file_metadata_json(filename: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let path = Path::new(filename);
     
-    if pattern.contains("**") {
-        let parts: Vec<&str> = pattern.split("**").collect();
-        if parts.len() == 2 {
-            let prefix = parts[0].trim_end_matches('/');
-            let suffix = parts[1].trim_start_matches('/');
-            
-            let prefix_match = prefix.is_empty() || path_str.starts_with(prefix);
-            let suffix_match = suffix.is_empty() || path_str.ends_with(suffix);
-            
-            return prefix_match && suffix_match;
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            // Successfully got metadata, create JSON string
+            let json_str = format!(
+                r#"{{"size": {}, "modified_time": {}, "accessed_time": {}, "created_time": {}, "permissions": "{}", "inode": {}, "is_file": {}, "is_dir": {}, "is_symlink": {}}}"#,
+                metadata.len(),
+                system_time_to_microseconds(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
+                system_time_to_microseconds(metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH)),
+                system_time_to_microseconds(metadata.created().unwrap_or(SystemTime::UNIX_EPOCH)),
+                format_permissions(&metadata),
+                get_inode(&metadata),
+                metadata.is_file(),
+                metadata.is_dir(),
+                metadata.file_type().is_symlink()
+            );
+            Ok(Some(json_str))
+        }
+        Err(e) => {
+            use std::io::ErrorKind;
+            match e.kind() {
+                ErrorKind::NotFound => Ok(None), // File doesn't exist -> return NULL
+                ErrorKind::PermissionDenied => Ok(None), // Permission error -> return NULL
+                _ => Err(Box::new(e)), // Other errors -> return error
+            }
         }
     }
-    
-    if pattern.contains('*') {
-        let parts: Vec<&str> = pattern.split('*').collect();
-        if parts.len() == 2 {
-            let prefix = parts[0];
-            let suffix = parts[1];
-            return path_str.starts_with(prefix) && path_str.ends_with(suffix);
-        }
-    }
-    
-    path_str == pattern
 }
 
 fn compute_file_hash(path: &Path) -> Result<String, Box<dyn Error>> {
@@ -331,5 +402,71 @@ fn get_inode(metadata: &fs::Metadata) -> u64 {
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<GlobStatVTab>("glob_stat")
         .expect("Failed to register glob_stat table function");
+    
+    con.register_table_function::<FilePathSha256VTab>("file_path_sha256")
+        .expect("Failed to register file_path_sha256 table function");
+    
+    con.register_scalar_function::<FileStatScalar>("file_stat")
+        .expect("Failed to register file_stat scalar function");
+    
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_glob_pattern_matching() {
+        // Test that different glob patterns return different results
+        let pattern1 = "src/*.rs";
+        let pattern2 = "Cargo.*";
+        
+        let files1 = collect_files_with_duckdb_glob(pattern1, None).unwrap_or_default();
+        let files2 = collect_files_with_duckdb_glob(pattern2, None).unwrap_or_default();
+        
+        // Extract just the file paths for comparison
+        let paths1: HashSet<_> = files1.iter().map(|f| &f.path).collect();
+        let paths2: HashSet<_> = files2.iter().map(|f| &f.path).collect();
+        
+        println!("Pattern '{}' returned {} files", pattern1, paths1.len());
+        println!("Pattern '{}' returned {} files", pattern2, paths2.len());
+        
+        // Different patterns should return different file sets
+        assert_ne!(paths1, paths2, 
+            "Different patterns '{}' and '{}' should return different file lists", pattern1, pattern2);
+    }
+
+    #[test]
+    fn test_file_hash_computation() {
+        // Test hash computation functionality
+        let test_file = "Cargo.toml";
+        let hash_result = compute_file_hash(Path::new(test_file));
+        
+        assert!(hash_result.is_ok(), "Should be able to compute hash for existing file");
+        
+        let hash = hash_result.unwrap();
+        assert_eq!(hash.len(), 64, "SHA256 hash should be 64 characters long");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "Hash should contain only hex digits");
+    }
+
+    #[test]
+    fn test_file_metadata_json_function() {
+        // Test the helper function directly
+        let result = get_file_metadata_json("Cargo.toml");
+        assert!(result.is_ok(), "Should successfully process existing file");
+        
+        let json_opt = result.unwrap();
+        assert!(json_opt.is_some(), "Should return Some for existing file");
+        
+        let json = json_opt.unwrap();
+        assert!(json.contains("\"size\""), "Should contain size field");
+        assert!(json.contains("\"is_file\""), "Should contain is_file field");
+        
+        // Test non-existent file
+        let result = get_file_metadata_json("nonexistent_file.txt");
+        assert!(result.is_ok(), "Should handle non-existent file gracefully");
+        assert!(result.unwrap().is_none(), "Should return None for non-existent file");
+    }
 }

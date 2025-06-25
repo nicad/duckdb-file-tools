@@ -12,6 +12,7 @@
 1. **Enhanced File Globbing** - `glob_stat()` function that extends DuckDB's built-in `glob()` by including file metadata
 2. **File Metadata Collection** - Retrieve stat() information (timestamps, size, inode, permissions)
 3. **Optional Content Hashing** - SHA256 computation of file contents
+4. **Other utilities**: blob_substr to extract specific bytes of a blob
 4. **Future: Age Encryption Support** - Encryption/decryption using the age format
 
 ### Key Advantages Over Built-in glob()
@@ -40,6 +41,8 @@ glob_stat(pattern TEXT, hash TEXT DEFAULT NULL)
 )
 ```
 
+This is a table function.
+
 ### Parameters
 - `pattern` (TEXT): File glob pattern (e.g., `*.txt`, `**/*.rs`)
 - `hash` (TEXT, optional): Hash algorithm (`NULL` or `'sha256'`)
@@ -56,6 +59,102 @@ SELECT path, size, hash FROM glob_stat('/data/*.csv', hash='sha256');
 SELECT path, size, modified_time 
 FROM glob_stat('/tmp/**/*') 
 WHERE size > 1000000 AND modified_time > '2024-01-01';
+```
+
+### file_stat() Function signature
+```sql
+file_stat(filename TEXT)
+→ STRUCT(
+    size BIGINT,
+    modified_time TIMESTAMP,
+    accessed_time TIMESTAMP,
+    created_time TIMESTAMP,
+    permissions TEXT,
+    inode BIGINT,
+    is_file BOOLEAN,
+    is_dir BOOLEAN,
+    is_symlink BOOLEAN
+)
+```
+
+This is a scalar function only.
+
+### Parameters
+- `filename` (TEXT): File path (e.g., `foo.txt`, `a/b/c/code.rs`)
+
+### Usage Examples
+```sql
+-- most basic
+SELECT file_stat(".gitignore");
+
+-- Basic file listing with metadata
+SELECT filename, file_stat(filename) FROM glob('/home/user/**/*.log');
+
+ -- Access specific fields from glob results
+SELECT filename, file_stat(filename).size FROM glob('*.txt');
+
+-- Filter based on file metadata
+SELECT filename FROM glob('*') WHERE file_stat(filename).size > 1000;
+
+-- Order by file metadata
+SELECT filename FROM glob('*') ORDER BY file_stat(filename).modified_time DESC;
+```
+
+### file_sha256_digest() Function signature
+
+Most important is to stream the file content by chunks to avoid reading all of it and keep memory usage good while using this function.
+
+```sql
+file_sha256_digest(filename TEXT)
+→ TEXT
+```
+
+This is a scalar function only.
+
+### Parameters
+- `filename` (TEXT): File path (e.g., `foo.txt`, `a/b/c/code.rs`)
+
+### Usage Examples
+```sql
+-- most basic
+SELECT file_sha256_digest(".gitignore");
+
+-- Basic file listing with metadata
+SELECT filename, file_sha256_digest(filename) FROM glob('/home/user/**/*.log');
+```
+
+### file_path_parts() Function signature
+
+```sql
+file_path_parts(path VARCHAR)
+→ STRUCT(
+    drive        VARCHAR,           -- “C:” on Windows, empty on POSIX
+    root         VARCHAR,           -- "\" or "/" if present, else empty
+    anchor       VARCHAR,           -- drive - plus - root  (convenience)
+    parent       VARCHAR,           -- dirname(path) without trailing sep
+    name         VARCHAR,           -- last component  ("archive.tar.gz")
+    stem         VARCHAR,           -- name minus last suffix  ("archive.tar")
+    suffix       VARCHAR,           -- last extension inc. dot  (".gz")
+    suffixes     LIST<VARCHAR>,     -- all extensions  [".tar", ".gz"]
+    parts        LIST<VARCHAR>,     -- path split on separators
+    is_absolute  BOOLEAN            -- True when root is non-empty
+);
+```
+
+This is a scalar function only.
+
+### Parameters
+- `path` (TEXT): A path to a file or a directory (e.g., `foo.txt`, `a/b/c/code.rs`, `mydir/subdir`)
+
+### Usage Examples
+```sql
+-- most basic
+SELECT file_path_parts(".gitignore");
+
+-- Basic file listing with metadata
+SELECT filename, file_path_parts(filename) FROM glob('/home/user/**/*.log');
+
+SELECT filename FROM glob('/home/user/**/*.log') WHERE file_path_parts(filename).suffix = '.csv';
 ```
 
 ## Technical Architecture
@@ -121,9 +220,9 @@ duckdb-file-tools/
 - **duckdb-crypto** - Cryptographic function implementation
 - **duckdb-zipfs** - Archive file handling
 
-these extensions can be found locally at ~/imports/
+these extensions can be found locally at docs/other-extensions/
 
-You can also find duckdb itself at ~/imports/duckdb but because it's a big code base only read what is needed from it.
+You can also find duckdb itself at docs/other-extensions/duckdb but because it's a big code base only read what is needed from it.
 
 ## Best practices
 * avoid comments describing what the next line does
