@@ -275,7 +275,7 @@ fn collect_files_with_duckdb_glob(
     Ok(results)
 }
 
-// Scalar file_stat function - returns JSON string with file metadata
+// Scalar file_stat function - returns STRUCT with file metadata
 struct FileStatScalar;
 
 impl VScalar for FileStatScalar {
@@ -289,7 +289,28 @@ impl VScalar for FileStatScalar {
         let input_vector = input.flat_vector(0);
         let input_data = input_vector.as_slice_with_len::<duckdb_string_t>(input.len());
         
-        let mut output_vector = output.flat_vector();
+        let mut struct_vector = output.struct_vector();
+        
+        // Get child vectors for each field
+        let mut size_vector = struct_vector.child(0, input.len());          // size: BIGINT
+        let mut modified_vector = struct_vector.child(1, input.len());      // modified_time: TIMESTAMP
+        let mut accessed_vector = struct_vector.child(2, input.len());      // accessed_time: TIMESTAMP  
+        let mut created_vector = struct_vector.child(3, input.len());       // created_time: TIMESTAMP
+        let permissions_vector = struct_vector.child(4, input.len());   // permissions: VARCHAR
+        let mut inode_vector = struct_vector.child(5, input.len());         // inode: BIGINT
+        let mut is_file_vector = struct_vector.child(6, input.len());       // is_file: BOOLEAN
+        let mut is_dir_vector = struct_vector.child(7, input.len());        // is_dir: BOOLEAN
+        let mut is_symlink_vector = struct_vector.child(8, input.len());    // is_symlink: BOOLEAN
+        
+        // Get raw data slices for direct assignment
+        let size_data = size_vector.as_mut_slice::<i64>();
+        let modified_data = modified_vector.as_mut_slice::<i64>();
+        let accessed_data = accessed_vector.as_mut_slice::<i64>();
+        let created_data = created_vector.as_mut_slice::<i64>();
+        let inode_data = inode_vector.as_mut_slice::<u64>();
+        let is_file_data = is_file_vector.as_mut_slice::<bool>();
+        let is_dir_data = is_dir_vector.as_mut_slice::<bool>();
+        let is_symlink_data = is_symlink_vector.as_mut_slice::<bool>();
         
         for i in 0..input.len() {
             let mut filename_duck_string = input_data[i];
@@ -299,12 +320,22 @@ impl VScalar for FileStatScalar {
             // - file doesn't exist -> return NULL
             // - permission error -> return NULL
             // - other errors -> return error
-            match get_file_metadata_json(&filename) {
-                Ok(Some(json_str)) => {
-                    output_vector.insert(i, json_str.as_str());
+            match get_file_metadata_struct(&filename) {
+                Ok(Some(metadata)) => {
+                    // Set all fields in the struct
+                    size_data[i] = metadata.size as i64;
+                    modified_data[i] = metadata.modified_time;
+                    accessed_data[i] = metadata.accessed_time;
+                    created_data[i] = metadata.created_time;
+                    permissions_vector.insert(i, metadata.permissions.as_str());
+                    inode_data[i] = metadata.inode;
+                    is_file_data[i] = metadata.is_file;
+                    is_dir_data[i] = metadata.is_dir;
+                    is_symlink_data[i] = metadata.is_symlink;
                 }
                 Ok(None) => {
-                    output_vector.set_null(i);
+                    // Set entire struct row as NULL
+                    struct_vector.set_null(i);
                 }
                 Err(e) => {
                     return Err(e);
@@ -316,10 +347,55 @@ impl VScalar for FileStatScalar {
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
+        // Create STRUCT return type with named fields
+        let struct_type = LogicalTypeHandle::struct_type(&[
+            ("size", LogicalTypeHandle::from(LogicalTypeId::Bigint)),
+            ("modified_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp)),
+            ("accessed_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp)),
+            ("created_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp)),
+            ("permissions", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ("inode", LogicalTypeHandle::from(LogicalTypeId::Bigint)),
+            ("is_file", LogicalTypeHandle::from(LogicalTypeId::Boolean)),
+            ("is_dir", LogicalTypeHandle::from(LogicalTypeId::Boolean)),
+            ("is_symlink", LogicalTypeHandle::from(LogicalTypeId::Boolean)),
+        ]);
+        
         vec![ScalarFunctionSignature::exact(
             vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            struct_type,
         )]
+    }
+}
+
+fn get_file_metadata_struct(filename: &str) -> Result<Option<FileMetadata>, Box<dyn std::error::Error>> {
+    let path = Path::new(filename);
+    
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            // Successfully got metadata, create FileMetadata struct
+            let file_meta = FileMetadata {
+                path: filename.to_string(),
+                size: metadata.len(),
+                modified_time: system_time_to_microseconds(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
+                accessed_time: system_time_to_microseconds(metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH)),
+                created_time: system_time_to_microseconds(metadata.created().unwrap_or(SystemTime::UNIX_EPOCH)),
+                permissions: format_permissions(&metadata),
+                inode: get_inode(&metadata),
+                is_file: metadata.is_file(),
+                is_dir: metadata.is_dir(),
+                is_symlink: metadata.file_type().is_symlink(),
+                hash: None, // Not needed for this function
+            };
+            Ok(Some(file_meta))
+        }
+        Err(e) => {
+            use std::io::ErrorKind;
+            match e.kind() {
+                ErrorKind::NotFound => Ok(None), // File doesn't exist -> return NULL
+                ErrorKind::PermissionDenied => Ok(None), // Permission error -> return NULL
+                _ => Err(Box::new(e)), // Other errors -> return error
+            }
+        }
     }
 }
 
