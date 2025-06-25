@@ -389,6 +389,235 @@ impl VScalar for FileSha256Scalar {
     }
 }
 
+// Scalar path_parts function - returns STRUCT with path component information
+struct PathPartsScalar;
+
+impl VScalar for PathPartsScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let input_vector = input.flat_vector(0);
+        let input_data = input_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        let mut struct_vector = output.struct_vector();
+        
+        // Get child vectors for each field
+        let drive_vector = struct_vector.child(0, input.len());           // drive: VARCHAR
+        let root_vector = struct_vector.child(1, input.len());            // root: VARCHAR
+        let anchor_vector = struct_vector.child(2, input.len());          // anchor: VARCHAR
+        let parent_vector = struct_vector.child(3, input.len());          // parent: VARCHAR
+        let name_vector = struct_vector.child(4, input.len());            // name: VARCHAR
+        let stem_vector = struct_vector.child(5, input.len());            // stem: VARCHAR
+        let suffix_vector = struct_vector.child(6, input.len());          // suffix: VARCHAR
+        let suffixes_vector = struct_vector.child(7, input.len());        // suffixes: LIST<VARCHAR>
+        let parts_vector = struct_vector.child(8, input.len());           // parts: LIST<VARCHAR>
+        let mut is_absolute_vector = struct_vector.child(9, input.len()); // is_absolute: BOOLEAN
+        
+        // Get raw data slice for boolean field
+        let is_absolute_data = is_absolute_vector.as_mut_slice::<bool>();
+        
+        for i in 0..input.len() {
+            let mut path_duck_string = input_data[i];
+            let path_str = DuckString::new(&mut path_duck_string).as_str();
+            
+            // Handle path parsing with error handling:
+            // - truly invalid input -> return NULL
+            // - valid paths (including empty) -> return parsed components
+            match parse_path_components(&path_str) {
+                Ok(components) => {
+                    // Set all fields in the struct
+                    drive_vector.insert(i, components.drive.as_str());
+                    root_vector.insert(i, components.root.as_str());
+                    anchor_vector.insert(i, components.anchor.as_str());
+                    parent_vector.insert(i, components.parent.as_str());
+                    name_vector.insert(i, components.name.as_str());
+                    stem_vector.insert(i, components.stem.as_str());
+                    suffix_vector.insert(i, components.suffix.as_str());
+                    
+                    // TODO: Handle LIST fields (suffixes, parts)
+                    // For now, insert empty strings as placeholder
+                    suffixes_vector.insert(i, "[]"); // JSON-like representation for now
+                    parts_vector.insert(i, "[]");
+                    
+                    is_absolute_data[i] = components.is_absolute;
+                }
+                Err(_) => {
+                    // Set entire struct row as NULL for truly invalid input
+                    struct_vector.set_null(i);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        // Create STRUCT return type with named fields
+        let struct_type = LogicalTypeHandle::struct_type(&[
+            ("drive", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ("root", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ("anchor", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ("parent", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ("name", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ("stem", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ("suffix", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ("suffixes", LogicalTypeHandle::from(LogicalTypeId::Varchar)), // TODO: LIST<VARCHAR>
+            ("parts", LogicalTypeHandle::from(LogicalTypeId::Varchar)),    // TODO: LIST<VARCHAR>
+            ("is_absolute", LogicalTypeHandle::from(LogicalTypeId::Boolean)),
+        ]);
+        
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
+            struct_type,
+        )]
+    }
+}
+
+#[derive(Debug)]
+struct PathComponents {
+    drive: String,
+    root: String,
+    anchor: String,
+    parent: String,
+    name: String,
+    stem: String,
+    suffix: String,
+    suffixes: Vec<String>,
+    parts: Vec<String>,
+    is_absolute: bool,
+}
+
+fn parse_path_components(path: &str) -> Result<PathComponents, Box<dyn std::error::Error>> {
+    // Handle empty string
+    if path.is_empty() {
+        return Ok(PathComponents {
+            drive: String::new(),
+            root: String::new(),
+            anchor: String::new(),
+            parent: String::new(),
+            name: String::new(),
+            stem: String::new(),
+            suffix: String::new(),
+            suffixes: Vec::new(),
+            parts: Vec::new(),
+            is_absolute: false,
+        });
+    }
+    
+    // Determine drive and root (cross-platform)
+    let (drive, root, rest) = parse_drive_and_root(path);
+    let anchor = format!("{}{}", drive, root);
+    let is_absolute = !root.is_empty();
+    
+    // Split remaining path into parts
+    let parts: Vec<String> = if rest.is_empty() {
+        Vec::new()
+    } else {
+        rest.split(['/', '\\']).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+    };
+    
+    // Get name (last component)
+    let name = parts.last().cloned().unwrap_or_default();
+    
+    // Get parent (all parts except last, joined back)
+    let parent = if parts.len() > 1 {
+        format!("{}{}", anchor, parts[..parts.len()-1].join("/"))
+    } else if !anchor.is_empty() && !parts.is_empty() {
+        anchor.clone()
+    } else {
+        String::new()
+    };
+    
+    // Parse name into stem and suffixes
+    let (stem, suffix, suffixes) = parse_name_components(&name);
+    
+    Ok(PathComponents {
+        drive,
+        root,
+        anchor,
+        parent,
+        name,
+        stem,
+        suffix,
+        suffixes,
+        parts,
+        is_absolute,
+    })
+}
+
+fn parse_drive_and_root(path: &str) -> (String, String, String) {
+    #[cfg(windows)]
+    {
+        // Windows: Check for drive letter (C:)
+        if path.len() >= 2 && path.chars().nth(1) == Some(':') {
+            let drive = path[..2].to_string();
+            if path.len() > 2 && (path.chars().nth(2) == Some('\\') || path.chars().nth(2) == Some('/')) {
+                let root = path.chars().nth(2).unwrap().to_string();
+                let rest = if path.len() > 3 { &path[3..] } else { "" };
+                return (drive, root, rest.to_string());
+            } else {
+                let rest = if path.len() > 2 { &path[2..] } else { "" };
+                return (drive, String::new(), rest.to_string());
+            }
+        }
+    }
+    
+    // POSIX or Windows without drive: Check for leading separator
+    if path.starts_with('/') || path.starts_with('\\') {
+        let root = path.chars().next().unwrap().to_string();
+        let rest = if path.len() > 1 { &path[1..] } else { "" };
+        (String::new(), root, rest.to_string())
+    } else {
+        (String::new(), String::new(), path.to_string())
+    }
+}
+
+fn parse_name_components(name: &str) -> (String, String, Vec<String>) {
+    if name.is_empty() {
+        return (String::new(), String::new(), Vec::new());
+    }
+    
+    // Find all dot positions (excluding leading dot for hidden files)
+    let mut dot_positions = Vec::new();
+    let chars: Vec<char> = name.chars().collect();
+    
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == '.' && i > 0 { // Skip leading dot
+            dot_positions.push(i);
+        }
+    }
+    
+    if dot_positions.is_empty() {
+        // No extensions
+        return (name.to_string(), String::new(), Vec::new());
+    }
+    
+    // Get last suffix (from last dot to end)
+    let last_dot = *dot_positions.last().unwrap();
+    let suffix = name[last_dot..].to_string();
+    
+    // Get stem (from start to last dot)
+    let stem = name[..last_dot].to_string();
+    
+    // Get all suffixes: each extension from each dot position to the next
+    let mut suffixes = Vec::new();
+    for i in 0..dot_positions.len() {
+        let start_pos = dot_positions[i];
+        let end_pos = if i + 1 < dot_positions.len() {
+            dot_positions[i + 1]
+        } else {
+            name.len()
+        };
+        suffixes.push(name[start_pos..end_pos].to_string());
+    }
+    
+    (stem, suffix, suffixes)
+}
+
 fn compute_file_sha256(filename: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let path = Path::new(filename);
     
@@ -561,6 +790,9 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_scalar_function::<FileSha256Scalar>("file_sha256")
         .expect("Failed to register file_sha256 scalar function");
     
+    con.register_scalar_function::<PathPartsScalar>("path_parts")
+        .expect("Failed to register path_parts scalar function");
+    
     Ok(())
 }
 
@@ -644,5 +876,36 @@ mod tests {
         let result = compute_file_sha256("nonexistent_file.txt");
         assert!(result.is_ok(), "Should handle non-existent file gracefully");
         assert!(result.unwrap().is_none(), "Should return None for non-existent file");
+    }
+
+    #[test]
+    fn test_path_parsing() {
+        // Test basic path parsing functionality
+        let result = parse_path_components("archive.tar.gz");
+        assert!(result.is_ok(), "Should successfully parse simple filename");
+        
+        let components = result.unwrap();
+        assert_eq!(components.name, "archive.tar.gz");
+        assert_eq!(components.stem, "archive.tar");
+        assert_eq!(components.suffix, ".gz");
+        assert_eq!(components.suffixes, vec![".tar", ".gz"]);
+        assert!(!components.is_absolute);
+        
+        // Test absolute path
+        let result = parse_path_components("/home/user/file.txt");
+        assert!(result.is_ok(), "Should successfully parse absolute path");
+        
+        let components = result.unwrap();
+        assert_eq!(components.name, "file.txt");
+        assert_eq!(components.suffix, ".txt");
+        assert_eq!(components.root, "/");
+        assert!(components.is_absolute);
+        
+        // Test empty string
+        let result = parse_path_components("");
+        assert!(result.is_ok(), "Should handle empty string");
+        let components = result.unwrap();
+        assert_eq!(components.name, "");
+        assert!(!components.is_absolute);
     }
 }

@@ -121,10 +121,10 @@ SELECT file_sha256(".gitignore");
 SELECT filename, file_sha256(filename) FROM glob('/home/user/**/*.log');
 ```
 
-### file_path_parts() Function signature
+### path_parts() Function signature
 
 ```sql
-file_path_parts(path VARCHAR)
+path_parts(path VARCHAR)
 → STRUCT(
     drive        VARCHAR,           -- “C:” on Windows, empty on POSIX
     root         VARCHAR,           -- "\" or "/" if present, else empty
@@ -147,13 +147,19 @@ This is a scalar function only.
 ### Usage Examples
 ```sql
 -- most basic
-SELECT file_path_parts(".gitignore");
+SELECT path_parts(".gitignore");
 
 -- Basic file listing with metadata
-SELECT filename, file_path_parts(filename) FROM glob('/home/user/**/*.log');
+SELECT filename, path_parts(filename) FROM glob('/home/user/**/*.log');
 
-SELECT filename FROM glob('/home/user/**/*.log') WHERE file_path_parts(filename).suffix = '.csv';
+SELECT filename FROM glob('/home/user/**/*.log') WHERE path_parts(filename).suffix = '.csv';
 ```
+
+### path_absolute() Function signature
+
+TODO
+
+scalar function.
 
 ## Technical Architecture
 
