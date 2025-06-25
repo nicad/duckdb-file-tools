@@ -1,0 +1,2 @@
+Hello, this is test file 1!
+It contains some sample data for testing our glob_stat function.

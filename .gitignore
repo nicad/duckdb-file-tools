@@ -1,0 +1,47 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# DuckDB extension build artifacts
+/build/
+/configure/
+
+# IDE files
+*.sublime-project
+*.sublime-workspace
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+
+# Python virtual environments (from extension build system)
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Extension binaries
+*.duckdb_extension
+*.dylib
+*.so
+*.dll
+
+# Log files
+*.log
+
+# Test data (optional - uncomment if you don't want to track test files)
+# /test_data/
