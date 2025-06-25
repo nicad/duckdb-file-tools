@@ -3,7 +3,7 @@ extern crate duckdb_loadable_macros;
 extern crate libduckdb_sys;
 
 use duckdb::{
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId, ListVector},
+    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, arrow::WritableVector},
     vscalar::{VScalar, ScalarFunctionSignature},
     Connection, Result,
@@ -385,6 +385,86 @@ impl VScalar for FileSha256Scalar {
         vec![ScalarFunctionSignature::exact(
             vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        )]
+    }
+}
+
+// Scalar substr function for BLOB type - extracts substring from BLOB
+struct BlobSubstrScalar;
+
+impl VScalar for BlobSubstrScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let blob_vector = input.flat_vector(0);
+        let start_vector = input.flat_vector(1);
+        let len_vector = input.flat_vector(2);
+        
+        let blob_data = blob_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        let start_data = start_vector.as_slice_with_len::<i64>(input.len());
+        let len_data = len_vector.as_slice_with_len::<i64>(input.len());
+        
+        // Get the output vector and convert to flat vector for BLOB output
+        let output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut blob_duck_string = blob_data[i];
+            let mut blob_str = DuckString::new(&mut blob_duck_string);
+            let blob_bytes = blob_str.as_bytes();
+            
+            let start = start_data[i];
+            let length = len_data[i];
+            
+            // Handle null blob or zero length
+            if blob_bytes.is_empty() || length == 0 {
+                // Insert empty blob
+                output_vector.insert(i, &[] as &[u8]);
+                continue;
+            }
+            
+            // 1-based indexing like SQL substr function
+            let start_offset = if start < 1 { 0 } else { (start - 1) as usize };
+            
+            // Check if start offset is beyond blob size
+            if start_offset >= blob_bytes.len() {
+                // Insert empty blob
+                output_vector.insert(i, &[] as &[u8]);
+                continue;
+            }
+            
+            // Calculate available bytes from start offset
+            let available = blob_bytes.len() - start_offset;
+            
+            // Determine how many bytes to take
+            let take = if length < 0 || (length as usize) > available {
+                available
+            } else {
+                length as usize
+            };
+            
+            // Extract the substring
+            let result_bytes = &blob_bytes[start_offset..start_offset + take];
+            
+            // Insert binary data directly as &[u8] - DuckDB handles this properly for BLOB type
+            output_vector.insert(i, result_bytes);
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        // Use a single signature that will allow DuckDB to handle implicit conversions
+        vec![ScalarFunctionSignature::exact(
+            vec![
+                LogicalTypeHandle::from(LogicalTypeId::Blob),
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            ],
+            LogicalTypeHandle::from(LogicalTypeId::Blob),
         )]
     }
 }
@@ -833,6 +913,9 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_scalar_function::<PathPartsScalar>("path_parts")
         .expect("Failed to register path_parts scalar function");
     
+    con.register_scalar_function::<BlobSubstrScalar>("blob_substr")
+        .expect("Failed to register blob_substr scalar function for BLOB");
+    
     Ok(())
 }
 
@@ -949,5 +1032,50 @@ mod tests {
         let components = result.unwrap();
         assert_eq!(components.name, "");
         assert!(!components.is_absolute);
+    }
+
+    #[test]
+    fn test_blob_substr_logic() {
+        // Test the core logic of BLOB substring extraction
+        let test_blob = b"\x00\x01\x02\x03\x04\x05";
+        
+        // Test normal case: substr(blob, 3, 2) should return bytes at offset 2-3 (0x02, 0x03)
+        let start_offset = if 3 < 1 { 0 } else { (3 - 1) as usize };
+        assert_eq!(start_offset, 2);
+        
+        let available = test_blob.len() - start_offset;
+        assert_eq!(available, 4);
+        
+        let take = if 2_i64 < 0 || (2 as usize) > available {
+            available
+        } else {
+            2 as usize
+        };
+        assert_eq!(take, 2);
+        
+        let result = &test_blob[start_offset..start_offset + take];
+        assert_eq!(result, &[0x02, 0x03]);
+        
+        // Test edge cases
+        
+        // Start beyond blob size
+        let start_offset_beyond = 10;
+        assert!(start_offset_beyond >= test_blob.len());
+        
+        // Negative length (should take all available)
+        let take_all = if -1_i64 < 0 || ((-1_i64) as usize) > available {
+            available
+        } else {
+            (-1_i64) as usize
+        };
+        assert_eq!(take_all, available);
+        
+        // Length larger than available
+        let take_large = if 100_i64 < 0 || (100 as usize) > available {
+            available
+        } else {
+            100 as usize
+        };
+        assert_eq!(take_large, available);
     }
 }

@@ -155,11 +155,52 @@ SELECT filename, path_parts(filename) FROM glob('/home/user/**/*.log');
 SELECT filename FROM glob('/home/user/**/*.log') WHERE path_parts(filename).suffix = '.csv';
 ```
 
-### path_absolute() Function signature
 
-TODO
+### glob_stat_sha256() Function Signature
 
-scalar function.
+Similar to glob_stat but adds a sha256.
+
+```sql
+glob_stat(pattern TEXT)
+→ TABLE(
+    path TEXT,
+    size BIGINT,
+    modified_time TIMESTAMP,
+    accessed_time TIMESTAMP,
+    created_time TIMESTAMP,
+    permissions TEXT,
+    inode BIGINT,
+    is_file BOOLEAN,
+    is_dir BOOLEAN,
+    is_symlink BOOLEAN,
+    hash VARCHAR
+)
+```
+
+This is a table function.
+
+### Parameters
+- `pattern` (TEXT): File glob pattern (e.g., `*.txt`, `**/*.rs`)
+
+### Usage Examples
+```sql
+-- Basic file listing with metadata
+SELECT * FROM glob_stat('/home/user/**/*.log');
+
+-- Include SHA256 hashes
+SELECT path, size, hash FROM glob_stat('/data/*.csv');
+
+-- Filter by file size and modification time
+SELECT path, size, modified_time
+FROM glob_stat('/tmp/**/*')
+WHERE size > 1000000 AND modified_time > '2024-01-01';
+```
+
+### Implementation considerations
+
+The most important part is to make it efficient AND parallel WITHIN this function. Calling glob() and file_sha256 is very slow somehow. We want very aggressive parallelism so doing a full scan of a lot of data is very fast.
+
+Also what we want to do if there is an easy way in Rust is to memory map the file to avoid chunking considerations. We need to discuss this before implementing it.
 
 ## Technical Architecture
 
