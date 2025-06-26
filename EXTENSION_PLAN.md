@@ -251,12 +251,26 @@ TODO: what compression method to use ? should it be pluggable ? what is a good r
 2. Streaming hash computation for large files
 3. Performance optimization for hash operations
 
-#### Phase 4: Add extra arguments and other similar utility functions
+#### Phase 4: Additional Utility Functions - **PARTIALLY IMPLEMENTED**
+
+**File Reading Functions - IMPLEMENTED**
+3. ✅ **`file_read_text(pathname VARCHAR) → VARCHAR`** - IMPLEMENTED
+   - Scalar function that reads text file content and returns as VARCHAR
+   - Returns NULL for non-existent files or read errors (graceful error handling)
+   - Can be used in SELECT expressions, WHERE clauses, and all SQL contexts
+   - Distinct from DuckDB's `read_text()` table function (single file vs glob pattern)
+
+4. ✅ **`file_read_blob(pathname VARCHAR) → BLOB`** - IMPLEMENTED  
+   - Scalar function that reads binary file content and returns as BLOB
+   - Returns NULL for non-existent files or read errors (graceful error handling)
+   - Handles any file type (text, binary, images, etc.)
+   - Can be combined with compression and processing functions
+
+**Planned Enhancements - PENDING**
 1. exclude pattern: skip files matching a glob, for example `'.git/**'` would skip all git repos
-2. ignore_case true/false for file name matching, for example `'*.csv'` would match .csv or .CSV
-3. `read_file_text(pathname VARCHAR) VARCHAR` and `read_file_binary(pathname VARCHAR) BLOB` scalar functions that given a name returns its content
-4. `permission_errors` optional argument can be 'ignore', 'print', 'fail' (default is 'ignore') - note: scalar functions like read_file_text/read_file_binary should error on permission issues
-5. `symlink` optional argument can be 'follow', 'skip' (default is 'skip') - follow will include loop detection when implemented
+2. ignore_case true/false for file name matching, for example `'*.csv'` would match .csv or .CSV  
+5. `permission_errors` optional argument can be 'ignore', 'print', 'fail' (default is 'ignore')
+6. `symlink` optional argument can be 'follow', 'skip' (default is 'skip') - follow will include loop detection when implemented
 
 #### Phase 5: Age Encryption Integration - **IMPLEMENTED**
 
@@ -534,13 +548,15 @@ You can also find duckdb itself at docs/other-extensions/duckdb but because it's
 5. Performance testing and optimization (debug output, jwalk alternatives)
 6. Add compression functions (GZIP, LZ4, ZSTD)
 7. Implement Age encryption integration
-8. Documentation and usage examples for all functions
-9. Debug and release builds
+8. Add file reading scalar functions (file_read_text, file_read_blob)
+9. Documentation and usage examples for all functions
+10. Debug and release builds
 
 ## Current Status
 
 The extension includes:
 - File system operations (glob_stat, file_stat, file_sha256, path_parts)
+- File reading functions (file_read_text, file_read_blob) with graceful error handling
 - High-performance parallel implementations with debug instrumentation  
 - Multi-algorithm compression support (GZIP, LZ4, ZSTD)
 - Age encryption implementation with multi-recipient support

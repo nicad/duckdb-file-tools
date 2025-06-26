@@ -260,6 +260,162 @@ SELECT
 FROM file_integrity_table;
 ```
 
+### `file_read_text(filename)`
+
+Reads the content of a text file and returns it as a VARCHAR string.
+
+**Syntax**
+```sql
+file_read_text(filename)
+```
+
+**Parameters**
+- `filename` (`VARCHAR`): Path to the file to read
+
+**Returns**
+- `VARCHAR`: The complete file content as text
+- `NULL`: If the file doesn't exist or cannot be read
+
+**Error Handling**
+- Returns `NULL` for non-existent files (no error thrown)
+- Returns `NULL` for permission errors (no error thrown)
+- Returns `NULL` for binary files that cannot be decoded as UTF-8
+
+**Comparison with DuckDB Built-ins**
+- **DuckDB's `read_text(glob)`**: Table function that reads multiple files matching a glob pattern, returns `(filename, content)` rows
+- **This `file_read_text(filename)`**: Scalar function that reads a single specific file, returns content directly
+
+**When to Use**
+- **Single file reading**: When you need content of one specific file
+- **SELECT expressions**: Can be used in any SELECT expression or WHERE clause
+- **Data processing**: When file content needs to be combined with other data
+
+**Example**
+```sql
+-- Read a configuration file
+SELECT file_read_text('config.yaml') AS config;
+
+-- Read multiple specific files
+SELECT 
+    filename,
+    file_read_text(filename) AS content
+FROM (VALUES ('file1.txt'), ('file2.txt'), ('config.json')) AS t(filename);
+
+-- Use file content in queries
+SELECT 
+    'large_file' AS category
+WHERE length(file_read_text('data.txt')) > 1000000;
+
+-- Process configuration with other data
+SELECT 
+    user_id,
+    settings,
+    file_read_text('default_config.json') AS default_config
+FROM user_settings;
+
+-- Handle missing files gracefully
+SELECT 
+    COALESCE(file_read_text('custom.conf'), file_read_text('default.conf'), '{}') AS config;
+```
+
+### `file_read_blob(filename)`
+
+Reads the content of a file as binary data and returns it as a BLOB.
+
+**Syntax**
+```sql
+file_read_blob(filename)
+```
+
+**Parameters**
+- `filename` (`VARCHAR`): Path to the file to read
+
+**Returns**
+- `BLOB`: The complete file content as binary data
+- `NULL`: If the file doesn't exist or cannot be read
+
+**Error Handling**
+- Returns `NULL` for non-existent files (no error thrown)
+- Returns `NULL` for permission errors (no error thrown)
+- Can read any file type (text, binary, images, etc.)
+
+**Comparison with DuckDB Built-ins**
+- **DuckDB's `read_blob(glob)`**: Table function that reads multiple files matching a glob pattern, returns `(filename, content)` rows
+- **This `file_read_blob(filename)`**: Scalar function that reads a single specific file, returns content directly
+
+**When to Use**
+- **Binary file processing**: Images, executables, compressed files, etc.
+- **Single file reading**: When you need content of one specific file
+- **Data pipelines**: When file content needs processing with other functions
+- **File size analysis**: Use with `octet_length()` for size calculations
+
+**Example**
+```sql
+-- Read a binary file
+SELECT file_read_blob('image.png') AS image_data;
+
+-- Check file sizes
+SELECT 
+    filename,
+    octet_length(file_read_blob(filename)) AS size_bytes
+FROM (VALUES ('file1.dat'), ('file2.bin')) AS t(filename);
+
+-- Process binary data
+SELECT 
+    filename,
+    substring(file_read_blob(filename), 1, 4) AS file_header
+FROM (VALUES ('data.pdf'), ('archive.zip')) AS t(filename);
+
+-- Combine with compression functions
+SELECT 
+    filename,
+    compress(file_read_blob(filename)) AS compressed_data,
+    octet_length(file_read_blob(filename)) AS original_size,
+    octet_length(compress(file_read_blob(filename))) AS compressed_size
+FROM (VALUES ('document.txt'), ('data.csv')) AS t(filename);
+
+-- Copy files using SQL
+CREATE TABLE file_backup AS
+SELECT 
+    'backup_' || filename AS backup_name,
+    file_read_blob(filename) AS file_data
+FROM (VALUES ('important.dat'), ('config.bin')) AS t(filename);
+```
+
+**Key Differences from DuckDB Built-ins**
+
+| Feature | DuckDB Built-in | File Tools Extension |
+|---------|----------------|---------------------|
+| **Function Type** | Table function | Scalar function |
+| **Input** | Glob pattern | Single filename |
+| **Output** | Table with (filename, content) | Content directly |
+| **Usage** | `FROM read_text('*.txt')` | `SELECT file_read_text('file.txt')` |
+| **Multiple files** | Yes (via glob) | No (one file per call) |
+| **WHERE clause** | Cannot use in WHERE | Can use in WHERE |
+| **SELECT expressions** | Limited | Full expression support |
+| **Error handling** | May throw errors | Returns NULL |
+
+**Migration Examples**
+
+```sql
+-- DuckDB built-in approach
+SELECT filename, content 
+FROM read_text('config/*.txt');
+
+-- Equivalent with file_read_text (if you know the filenames)
+SELECT 
+    filename,
+    file_read_text(filename) AS content
+FROM (VALUES ('config/app.txt'), ('config/db.txt')) AS t(filename);
+
+-- Or discover files first, then read
+SELECT 
+    path AS filename,
+    file_read_text(path) AS content
+FROM glob_stat('config/*.txt')
+WHERE is_file = true;
+```
+
 ### `path_parts(path)`
 
 Decomposes a file path into its constituent components with cross-platform support.

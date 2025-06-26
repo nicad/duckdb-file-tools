@@ -377,6 +377,88 @@ impl VScalar for FileSha256Scalar {
     }
 }
 
+// Scalar file_read_text function - reads file content as text
+struct FileReadTextScalar;
+
+impl VScalar for FileReadTextScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let input_vector = input.flat_vector(0);
+        let input_data = input_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        let mut output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut filename_duck_string = input_data[i];
+            let filename = DuckString::new(&mut filename_duck_string).as_str();
+            
+            match std::fs::read_to_string(&*filename) {
+                Ok(content) => {
+                    output_vector.insert(i, content.as_str());
+                }
+                Err(_) => {
+                    output_vector.set_null(i);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        )]
+    }
+}
+
+// Scalar file_read_blob function - reads file content as blob
+struct FileReadBlobScalar;
+
+impl VScalar for FileReadBlobScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let input_vector = input.flat_vector(0);
+        let input_data = input_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        let mut output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut filename_duck_string = input_data[i];
+            let filename = DuckString::new(&mut filename_duck_string).as_str();
+            
+            match std::fs::read(&*filename) {
+                Ok(content) => {
+                    output_vector.insert(i, content.as_slice());
+                }
+                Err(_) => {
+                    output_vector.set_null(i);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
+            LogicalTypeHandle::from(LogicalTypeId::Blob),
+        )]
+    }
+}
+
 // Parallel glob_stat_sha256 function using jwalk and rayon for performance
 #[repr(C)]
 struct GlobStatSha256ParallelBindData {
@@ -2452,6 +2534,12 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     
     con.register_scalar_function::<FileSha256Scalar>("file_sha256")
         .expect("Failed to register file_sha256 scalar function");
+    
+    con.register_scalar_function::<FileReadTextScalar>("file_read_text")
+        .expect("Failed to register file_read_text scalar function");
+    
+    con.register_scalar_function::<FileReadBlobScalar>("file_read_blob")
+        .expect("Failed to register file_read_blob scalar function");
     
     con.register_scalar_function::<PathPartsScalar>("path_parts")
         .expect("Failed to register path_parts scalar function");
