@@ -23,6 +23,7 @@ use std::{
 };
 use sha2::{Sha256, Digest};
 use glob::glob;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 struct FileMetadata {
@@ -221,30 +222,57 @@ impl VTab for FilePathSha256VTab {
 
 fn collect_files_with_duckdb_glob(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let mut results = Vec::new();
+    let mut error_count = 0;
     
-    // Use the glob crate for pattern matching (same as DuckDB's glob implementation)
-    for entry in glob(pattern)? {
-        let path = entry?;
-        
-        // Skip if it's not a file (directories, symlinks, etc. can be included based on metadata)
-        let metadata = fs::metadata(&path)?;
-        
-        let file_meta = FileMetadata {
-            path: path.to_string_lossy().to_string(),
-            size: metadata.len(),
-            modified_time: system_time_to_microseconds(metadata.modified()?),
-            accessed_time: system_time_to_microseconds(metadata.accessed()?),
-            created_time: system_time_to_microseconds(metadata.created().unwrap_or(metadata.modified()?)),
-            permissions: format_permissions(&metadata),
-            inode: get_inode(&metadata),
-            is_file: metadata.is_file(),
-            is_dir: metadata.is_dir(),
-            is_symlink: metadata.file_type().is_symlink(),
-            hash: None, // No hash computation in glob_stat
-        };
-        
-        results.push(file_meta);
+    // Convert DuckDB glob patterns to Rust glob crate patterns
+    let rust_pattern = normalize_glob_pattern(pattern);
+    
+    // Use the glob crate for pattern matching 
+    for entry in glob(&rust_pattern)? {
+        match entry {
+            Ok(path) => {
+                // Try to get metadata, but don't fail the entire operation for permission errors
+                match fs::metadata(&path) {
+                    Ok(metadata) => {
+                        let file_meta = FileMetadata {
+                            path: path.to_string_lossy().to_string(),
+                            size: metadata.len(),
+                            modified_time: system_time_to_microseconds(
+                                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+                            ),
+                            accessed_time: system_time_to_microseconds(
+                                metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH)
+                            ),
+                            created_time: system_time_to_microseconds(
+                                metadata.created().unwrap_or_else(|_| 
+                                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+                                )
+                            ),
+                            permissions: format_permissions(&metadata),
+                            inode: get_inode(&metadata),
+                            is_file: metadata.is_file(),
+                            is_dir: metadata.is_dir(),
+                            is_symlink: metadata.file_type().is_symlink(),
+                            hash: None, // No hash computation in glob_stat
+                        };
+                        
+                        results.push(file_meta);
+                    }
+                    Err(_) => {
+                        // Skip files we can't access (permission errors, etc.)
+                        error_count += 1;
+                    }
+                }
+            }
+            Err(_) => {
+                // Skip entries that couldn't be processed
+                error_count += 1;
+            }
+        }
     }
+    
+    // For debugging: you could log error_count here
+    // eprintln!("Processed {} files, {} errors", results.len(), error_count);
     
     Ok(results)
 }
@@ -386,6 +414,162 @@ impl VScalar for FileSha256Scalar {
             vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         )]
+    }
+}
+
+// Parallel glob_stat_sha256 function using jwalk and rayon for performance
+#[repr(C)]
+struct GlobStatSha256ParallelBindData {
+    pattern: String,
+    files: Vec<FileMetadata>,
+}
+
+#[repr(C)]
+struct GlobStatSha256ParallelInitData {
+    current_index: AtomicUsize,
+}
+
+struct GlobStatSha256ParallelVTab;
+
+impl VTab for GlobStatSha256ParallelVTab {
+    type InitData = GlobStatSha256ParallelInitData;
+    type BindData = GlobStatSha256ParallelBindData;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        // Same column structure as the regular glob_stat_sha256
+        bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("size", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("modified_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("accessed_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("created_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("permissions", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("inode", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("is_file", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("is_dir", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("is_symlink", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("hash", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+
+        let pattern = bind.get_parameter(0).to_string();
+
+        // Use parallel file collection with hash computation
+        let files = collect_files_with_parallel_hashing(&pattern)?;
+
+        Ok(GlobStatSha256ParallelBindData {
+            pattern,
+            files,
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(GlobStatSha256ParallelInitData {
+            current_index: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn std::error::Error>> {
+        let init_data = func.get_init_data();
+        let bind_data = func.get_bind_data();
+
+        let current_idx = init_data.current_index.load(Ordering::Relaxed);
+        
+        if current_idx >= bind_data.files.len() {
+            output.set_len(0);
+            return Ok(());
+        }
+
+        let file_meta = &bind_data.files[current_idx];
+        
+        // Insert data into output vectors (same as existing implementation)
+        output.flat_vector(0).insert(0, file_meta.path.as_str());
+        output.flat_vector(1).insert(0, file_meta.size.to_string().as_str());
+        output.flat_vector(2).insert(0, file_meta.modified_time.to_string().as_str());
+        output.flat_vector(3).insert(0, file_meta.accessed_time.to_string().as_str());
+        output.flat_vector(4).insert(0, file_meta.created_time.to_string().as_str());
+        output.flat_vector(5).insert(0, file_meta.permissions.as_str());
+        output.flat_vector(6).insert(0, file_meta.inode.to_string().as_str());
+        output.flat_vector(7).insert(0, if file_meta.is_file { "true" } else { "false" });
+        output.flat_vector(8).insert(0, if file_meta.is_dir { "true" } else { "false" });
+        output.flat_vector(9).insert(0, if file_meta.is_symlink { "true" } else { "false" });
+        
+        // Include hash if available
+        let hash_str = file_meta.hash.as_ref().map(|s| s.as_str()).unwrap_or("");
+        output.flat_vector(10).insert(0, hash_str);
+
+        output.set_len(1);
+        
+        init_data.current_index.store(current_idx + 1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    }
+}
+
+fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
+    // Step 1: Use the existing glob crate to find files (just like the regular glob_stat)
+    let rust_pattern = normalize_glob_pattern(pattern);
+    let file_paths: Vec<_> = glob(&rust_pattern)?
+        .filter_map(|entry| entry.ok())
+        .collect();
+
+    // Step 2: Parallel metadata extraction and hash computation using rayon
+    let files: Vec<FileMetadata> = file_paths
+        .into_par_iter()
+        .filter_map(|path| {
+            // Get metadata first - use robust error handling like the sequential version
+            let metadata = match fs::metadata(&path) {
+                Ok(meta) => meta,
+                Err(_) => return None, // Skip files we can't access
+            };
+
+            // Compute hash in parallel for files only
+            let hash = if metadata.is_file() {
+                match compute_file_hash_streaming(&path) {
+                    Ok(h) => Some(h),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            Some(FileMetadata {
+                path: path.to_string_lossy().to_string(),
+                size: metadata.len(),
+                modified_time: system_time_to_microseconds(
+                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+                ),
+                accessed_time: system_time_to_microseconds(
+                    metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH)
+                ),
+                created_time: system_time_to_microseconds(
+                    metadata.created().unwrap_or_else(|_| 
+                        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+                    )
+                ),
+                permissions: format_permissions(&metadata),
+                inode: get_inode(&metadata),
+                is_file: metadata.is_file(),
+                is_dir: metadata.is_dir(),
+                is_symlink: metadata.file_type().is_symlink(),
+                hash,
+            })
+        })
+        .collect();
+
+    Ok(files)
+}
+
+fn normalize_glob_pattern(pattern: &str) -> String {
+    // Convert DuckDB glob patterns to Rust glob crate patterns
+    // DuckDB's "/path/**" is equivalent to Rust glob's "/path/**/*"
+    if pattern.ends_with("/**") {
+        format!("{}/*", pattern)
+    } else if pattern.ends_with("\\**") {
+        // Handle Windows paths
+        format!("{}\\*", pattern)
+    } else {
+        pattern.to_string()
     }
 }
 
@@ -903,6 +1087,9 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     
     con.register_table_function::<FilePathSha256VTab>("file_path_sha256")
         .expect("Failed to register file_path_sha256 table function");
+    
+    con.register_table_function::<GlobStatSha256ParallelVTab>("glob_stat_sha256_parallel")
+        .expect("Failed to register glob_stat_sha256_parallel table function");
     
     con.register_scalar_function::<FileStatScalar>("file_stat")
         .expect("Failed to register file_stat scalar function");

@@ -71,6 +71,70 @@ GROUP BY hash
 HAVING count(*) > 1;
 ```
 
+### `glob_stat_sha256_parallel(pattern)`
+
+**High-performance parallel version** of file scanning with SHA256 hash computation. Uses multi-threading to dramatically improve performance on large directories.
+
+**Syntax**
+```sql
+SELECT * FROM glob_stat_sha256_parallel(pattern)
+```
+
+**Parameters**
+- `pattern` (`VARCHAR`): A glob pattern to match files
+
+**Returns**
+Same columns as `file_path_sha256`:
+- `path` (`VARCHAR`): Full path to the file
+- `size` (`VARCHAR`): File size in bytes
+- `modified_time` (`VARCHAR`): Last modification time
+- `accessed_time` (`VARCHAR`): Last access time  
+- `created_time` (`VARCHAR`): Creation time
+- `permissions` (`VARCHAR`): File permissions
+- `inode` (`VARCHAR`): File inode number
+- `is_file` (`VARCHAR`): Whether the entry is a file
+- `is_dir` (`VARCHAR`): Whether the entry is a directory
+- `is_symlink` (`VARCHAR`): Whether the entry is a symbolic link
+- `hash` (`VARCHAR`): SHA256 hash of the file contents (lowercase hex)
+
+**Performance Features**
+- **Multi-threaded hash computation**: Uses `rayon` to compute hashes on multiple CPU cores simultaneously
+- **Parallel metadata extraction**: File metadata and hash computation runs in parallel across all CPU cores
+- **Same glob patterns**: Uses identical pattern matching as `glob_stat` but with parallel processing
+- **Memory efficient**: Streaming hash computation prevents memory issues with large files
+- **Lock-free design**: Minimizes thread contention for maximum throughput
+
+**When to Use**
+- **Large directories**: Hundreds or thousands of files
+- **Performance critical**: When speed is more important than resource usage
+- **Batch processing**: Creating file manifests, backup verification, etc.
+- **Multi-core systems**: Best performance on systems with multiple CPU cores
+
+**Example**
+```sql
+-- Fast hash computation for large directories
+SELECT path, hash 
+FROM glob_stat_sha256_parallel('large_dataset/**/*');
+
+-- Performance comparison with regular version
+-- (Use this for large directories, use file_path_sha256 for small ones)
+SELECT COUNT(*) as file_count, 'parallel' as method
+FROM glob_stat_sha256_parallel('**/*.log')
+UNION ALL
+SELECT COUNT(*) as file_count, 'sequential' as method  
+FROM file_path_sha256('**/*.log');
+
+-- Create file integrity manifest quickly
+CREATE TABLE backup_manifest AS
+SELECT 
+    path,
+    hash,
+    size,
+    modified_time
+FROM glob_stat_sha256_parallel('/backup/data/**/*')
+WHERE is_file = 'true';
+```
+
 ## Scalar Functions
 
 ### `file_stat(filename)`
@@ -284,23 +348,33 @@ FROM file_contents;
 
 ### File Integrity Checking
 ```sql
--- Create a manifest of file hashes
+-- Create a manifest of file hashes (fast parallel version)
 CREATE TABLE file_manifest AS
 SELECT 
     path,
-    file_sha256(path) AS hash,
-    file_stat(path).size AS size,
-    file_stat(path).modified_time AS last_modified
-FROM glob_stat('important_files/**/*')
-WHERE file_stat(path).is_file;
+    hash,
+    CAST(size AS BIGINT) AS size,
+    modified_time AS last_modified
+FROM glob_stat_sha256_parallel('important_files/**/*')
+WHERE is_file = 'true';
 
--- Later, verify integrity
+-- Later, verify integrity (sequential for individual files)
 SELECT 
     path,
     hash AS stored_hash,
     file_sha256(path) AS current_hash,
     hash = file_sha256(path) AS is_valid
 FROM file_manifest;
+
+-- Alternative: Create manifest using sequential method (for small datasets)
+CREATE TABLE small_file_manifest AS
+SELECT 
+    path,
+    file_sha256(path) AS hash,
+    file_stat(path).size AS size,
+    file_stat(path).modified_time AS last_modified
+FROM glob_stat('small_dataset/**/*')
+WHERE file_stat(path).is_file;
 ```
 
 ### File Organization Analysis
@@ -319,8 +393,28 @@ ORDER BY total_size DESC;
 
 ### Duplicate File Detection
 ```sql
--- Find files with identical content
+-- Find files with identical content (fast parallel version)
 WITH file_hashes AS (
+    SELECT 
+        path,
+        hash,
+        CAST(size AS BIGINT) AS size
+    FROM glob_stat_sha256_parallel('**/*')
+    WHERE is_file = 'true' AND size != '0'
+)
+SELECT 
+    hash,
+    size,
+    array_agg(path) AS duplicate_files,
+    count(*) AS duplicate_count
+FROM file_hashes
+WHERE hash IS NOT NULL AND hash != ''
+GROUP BY hash, size
+HAVING count(*) > 1
+ORDER BY duplicate_count DESC, size DESC;
+
+-- Alternative: Sequential version for smaller datasets
+WITH file_hashes_sequential AS (
     SELECT 
         path,
         file_sha256(path) AS hash,
@@ -333,7 +427,7 @@ SELECT
     size,
     array_agg(path) AS duplicate_files,
     count(*) AS duplicate_count
-FROM file_hashes
+FROM file_hashes_sequential
 WHERE hash IS NOT NULL
 GROUP BY hash, size
 HAVING count(*) > 1
