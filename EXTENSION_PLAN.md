@@ -335,6 +335,34 @@ Based on the rage library analysis, implement the following DuckDB scalar functi
 - Handle invalid keys, wrong passphrases, corrupted data gracefully
 - Follow existing error handling patterns from compression functions
 
+##### Usage Scenarios
+
+Age encryption can be useful in the following scenario:
+* keep the private key inside duckdb using the secret store and give out the public key.
+    * when receiving content encrypted with our public key decrypt the data before storing in the database. This makes sure nobody else can read the data while in transit
+* keep the public key in duckdb (secret store might be a convenient place but any table or even client program is fine)
+    * don't have access to the private key, it is managed outside of the duckdb database
+    * store data using the public key so anyone with access to the database can't read the data
+    * when needed a client program with access to the private key can read the data back.
+
+##### Integration with DuckDb Secrets Manager
+
+see: https://duckdb.org/docs/stable/configuration/secrets_manager.html
+
+We need our file_tools extension to register a secret type called 'age', then we could have 'KEY_ID' as an arbitrary name for that key pair and have the following additional key/pairs:
+* 'PUBLIC' required
+* 'PRIVATE' optional
+
+We need to support both PERSISTENT and non-persistent.
+
+All the `age_*` functions can take either actual public or private keys as created by age-keygen or key ids from the secret manager: if a key doesn't start with 'age' or 'AGE-SECRET' then it is assumed to be a secret name. For encryption functions the PUBLIC value with be used and for decryption functions the PRIVATE value will be used. This means no secret should ever be created with a 'KEY_ID' starting with these prefixes (ideally it would get rejected but not sure it's possible)
+
+Open questions:
+* can age_keygen(1) directly create a secret entry ? probably by changing its argument to be a varchar
+* is there a way to combine a scalar function like age_keygen(1) or a table version with 'create secret' ?
+* should we support keys like PUBLIC_FILE and PRIVATE_FILE too ?
+* should we just remove age_keygen(1) and instead require users to manually create secrets using read_text or a similar method to read external file values into secret managers
+
 ##### Usage Examples
 
 ```sql
