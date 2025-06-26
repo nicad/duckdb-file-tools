@@ -180,82 +180,6 @@ impl VTab for GlobStatVTab {
 
 // Scalar-like functions implemented as table functions that return single rows
 
-
-
-// file_path_sha256(filename, content_hash) - returns combined hash
-#[repr(C)]
-struct FilePathSha256BindData {
-    filename: String,
-    content_hash: String,
-}
-
-#[repr(C)]
-struct FilePathSha256InitData {
-    done: AtomicBool,
-}
-
-struct FilePathSha256VTab;
-
-impl VTab for FilePathSha256VTab {
-    type InitData = FilePathSha256InitData;
-    type BindData = FilePathSha256BindData;
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        bind.add_result_column("path_sha256", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-
-        let filename = bind.get_parameter(0).to_string();
-        let content_hash = bind.get_parameter(1).to_string();
-        Ok(FilePathSha256BindData { filename, content_hash })
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(FilePathSha256InitData {
-            done: AtomicBool::new(false),
-        })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-
-        if init_data.done.swap(true, Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-
-        let path = Path::new(&bind_data.filename);
-        let metadata = fs::metadata(path)?;
-        
-        // Create combined string: filename + modified_time + size + content_hash
-        let modified_time = system_time_to_microseconds(metadata.modified()?);
-        let size = metadata.len();
-        let combined = format!("{}:{}:{}:{}", 
-            bind_data.filename, modified_time, size, bind_data.content_hash);
-        
-        // Hash the combined string
-        let mut hasher = Sha256::new();
-        hasher.update(combined.as_bytes());
-        let result = hasher.finalize();
-        let hash = format!("{:x}", result);
-
-        let hash_str = CString::new(hash)?;
-        output.flat_vector(0).insert(0, hash_str);
-
-        output.set_len(1);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // filename
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // content_hash
-        ])
-    }
-}
-
 fn collect_files_with_duckdb_glob(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let mut results = Vec::new();
     let mut error_count = 0;
@@ -2516,9 +2440,6 @@ fn age_decrypt_passphrase(data: &[u8], passphrase: &str) -> Result<Vec<u8>, Box<
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<GlobStatVTab>("glob_stat")
         .expect("Failed to register glob_stat table function");
-    
-    con.register_table_function::<FilePathSha256VTab>("file_path_sha256")
-        .expect("Failed to register file_path_sha256 table function");
     
     con.register_table_function::<GlobStatSha256ParallelVTab>("glob_stat_sha256_parallel")
         .expect("Failed to register glob_stat_sha256_parallel table function");

@@ -18,7 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Table Functions**
   - `glob_stat(pattern)` - File metadata collection with glob patterns
-  - `file_path_sha256(pattern)` - File scanning with SHA256 hash computation
   - `glob_stat_sha256_parallel(pattern)` - High-performance parallel file hashing
   - `glob_stat_sha256_jwalk(pattern)` - Alternative parallel implementation using jwalk
 

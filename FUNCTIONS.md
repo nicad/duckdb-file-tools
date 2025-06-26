@@ -57,35 +57,6 @@ FROM glob_stat('**/*')
 WHERE CAST(size AS BIGINT) > 1000000;
 ```
 
-### `file_path_sha256(pattern)`
-
-Scans files matching a glob pattern and computes SHA256 hashes along with metadata.
-
-**Syntax**
-```sql
-SELECT * FROM file_path_sha256(pattern)
-```
-
-**Parameters**
-- `pattern` (`VARCHAR`): A glob pattern to match files
-
-**Returns**
-Same columns as `glob_stat` plus:
-- `hash` (`VARCHAR`): SHA256 hash of the file contents (lowercase hex)
-
-**Example**
-```sql
--- Generate SHA256 hashes for all files
-SELECT path, hash 
-FROM file_path_sha256('*');
-
--- Find duplicate files by hash
-SELECT hash, array_agg(path) as duplicate_files
-FROM file_path_sha256('**/*')
-WHERE is_file = 'true'
-GROUP BY hash
-HAVING count(*) > 1;
-```
 
 ### `glob_stat_sha256_parallel(pattern)`
 
@@ -100,7 +71,7 @@ SELECT * FROM glob_stat_sha256_parallel(pattern)
 - `pattern` (`VARCHAR`): A glob pattern to match files
 
 **Returns**
-Same columns as `file_path_sha256`:
+Returns the following columns:
 - `path` (`VARCHAR`): Full path to the file
 - `size` (`VARCHAR`): File size in bytes
 - `modified_time` (`VARCHAR`): Last modification time
@@ -132,13 +103,12 @@ Same columns as `file_path_sha256`:
 SELECT path, hash 
 FROM glob_stat_sha256_parallel('large_dataset/**/*');
 
--- Performance comparison with regular version
--- (Use this for large directories, use file_path_sha256 for small ones)
+-- Performance comparison with different implementations
 SELECT COUNT(*) as file_count, 'parallel' as method
 FROM glob_stat_sha256_parallel('**/*.log')
 UNION ALL
-SELECT COUNT(*) as file_count, 'sequential' as method  
-FROM file_path_sha256('**/*.log');
+SELECT COUNT(*) as file_count, 'jwalk' as method  
+FROM glob_stat_sha256_jwalk('**/*.log');
 
 -- Create file integrity manifest quickly
 CREATE TABLE backup_manifest AS
@@ -164,7 +134,7 @@ SELECT * FROM glob_stat_sha256_jwalk(pattern)
 - `pattern` (`VARCHAR`): A glob pattern to match files
 
 **Returns**
-Same columns as `glob_stat_sha256_parallel`:
+Same columns as the parallel implementation:
 - `path` (`VARCHAR`): Full path to the file
 - `size` (`VARCHAR`): File size in bytes  
 - `modified_time` (`VARCHAR`): Last modification time
@@ -831,8 +801,7 @@ SELECT
     hash = file_sha256(path) AS is_valid
 FROM file_manifest;
 
--- Alternative: Create manifest using sequential method (for small datasets)
-CREATE TABLE small_file_manifest AS
+-- Alternative: Use individual file functions for targeted analysis
 SELECT 
     path,
     file_sha256(path) AS hash,
@@ -878,22 +847,24 @@ GROUP BY hash, size
 HAVING count(*) > 1
 ORDER BY duplicate_count DESC, size DESC;
 
--- Alternative: Sequential version for smaller datasets
-WITH file_hashes_sequential AS (
+-- Alternative: Use individual file hashing for targeted analysis
+WITH specific_files AS (
+    SELECT path FROM glob_stat('important_docs/**/*') WHERE is_file = 'true'
+),
+file_hashes AS (
     SELECT 
         path,
         file_sha256(path) AS hash,
-        CAST(size AS BIGINT) AS size
-    FROM glob_stat('**/*')
-    WHERE is_file = 'true' AND size != '0'
+        file_stat(path).size AS size
+    FROM specific_files
+    WHERE file_sha256(path) IS NOT NULL
 )
 SELECT 
     hash,
     size,
     array_agg(path) AS duplicate_files,
     count(*) AS duplicate_count
-FROM file_hashes_sequential
-WHERE hash IS NOT NULL
+FROM file_hashes
 GROUP BY hash, size
 HAVING count(*) > 1
 ORDER BY duplicate_count DESC, size DESC;
