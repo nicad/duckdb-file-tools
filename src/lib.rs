@@ -2735,4 +2735,115 @@ mod tests {
         };
         assert_eq!(take_large, available);
     }
+
+    #[test]
+    fn test_file_read_text_functionality() {
+        // Test reading an existing text file
+        let existing_file = "Cargo.toml";
+        let content = std::fs::read_to_string(existing_file).expect("Should be able to read Cargo.toml");
+        assert!(!content.is_empty(), "Cargo.toml should have content");
+        assert!(content.contains("[package]"), "Cargo.toml should contain package info");
+        
+        // Test reading a non-existent file (should return error, not panic)
+        let nonexistent_file = "this_file_does_not_exist_12345.txt";
+        let result = std::fs::read_to_string(nonexistent_file);
+        assert!(result.is_err(), "Should get error for non-existent file");
+        
+        // Test reading .gitignore as a known text file
+        if std::path::Path::new(".gitignore").exists() {
+            let gitignore_content = std::fs::read_to_string(".gitignore").unwrap();
+            assert!(!gitignore_content.is_empty(), ".gitignore should have content");
+        }
+    }
+
+    #[test]
+    fn test_file_read_blob_functionality() {
+        // Test reading an existing file as binary
+        let existing_file = "Cargo.toml";
+        let content = std::fs::read(existing_file).expect("Should be able to read Cargo.toml as binary");
+        assert!(!content.is_empty(), "Cargo.toml should have binary content");
+        
+        // Verify it's the same content as text reading
+        let text_content = std::fs::read_to_string(existing_file).expect("Should read as text");
+        assert_eq!(content, text_content.as_bytes(), "Binary and text content should match");
+        
+        // Test reading a non-existent file (should return error, not panic)
+        let nonexistent_file = "this_file_does_not_exist_12345.bin";
+        let result = std::fs::read(nonexistent_file);
+        assert!(result.is_err(), "Should get error for non-existent file");
+        
+        // Test reading different file types if they exist
+        let test_files = ["README.md", ".gitignore", "Makefile"];
+        for test_file in &test_files {
+            if std::path::Path::new(test_file).exists() {
+                let result = std::fs::read(test_file);
+                assert!(result.is_ok(), "Should be able to read {} as binary", test_file);
+                let content = result.unwrap();
+                assert!(!content.is_empty(), "{} should have content", test_file);
+            }
+        }
+    }
+
+    #[test]
+    fn test_file_read_error_handling() {
+        // Test various error conditions for file reading
+        
+        // Non-existent file
+        assert!(std::fs::read_to_string("nonexistent_file_test.txt").is_err());
+        assert!(std::fs::read("nonexistent_file_test.bin").is_err());
+        
+        // Empty filename (should fail)
+        assert!(std::fs::read_to_string("").is_err());
+        assert!(std::fs::read("").is_err());
+        
+        // Directory instead of file (should fail)
+        if std::path::Path::new("src").exists() && std::path::Path::new("src").is_dir() {
+            assert!(std::fs::read_to_string("src").is_err());
+            assert!(std::fs::read("src").is_err());
+        }
+    }
+
+    #[test]
+    fn test_file_reading_with_test_data() {
+        // Test with test data directory if it exists
+        if std::path::Path::new("test_data").exists() {
+            // Check if we have test files
+            if std::path::Path::new("test_data/dir1/file_a.txt").exists() {
+                let result = std::fs::read_to_string("test_data/dir1/file_a.txt");
+                assert!(result.is_ok(), "Should be able to read test data file");
+                
+                let blob_result = std::fs::read("test_data/dir1/file_a.txt");
+                assert!(blob_result.is_ok(), "Should be able to read test data file as blob");
+            }
+            
+            // Test CSV file if available
+            if std::path::Path::new("test_data/dir2/file_x.csv").exists() {
+                let csv_content = std::fs::read_to_string("test_data/dir2/file_x.csv");
+                assert!(csv_content.is_ok(), "Should be able to read CSV file");
+                
+                let csv_blob = std::fs::read("test_data/dir2/file_x.csv");
+                assert!(csv_blob.is_ok(), "Should be able to read CSV as blob");
+            }
+        }
+    }
+
+    #[test]
+    fn test_utf8_handling_file_read_text() {
+        // Test UTF-8 handling for text files
+        use std::io::Write;
+        
+        // Create a temporary file with UTF-8 content
+        let temp_file = "temp_utf8_test.txt";
+        {
+            let mut file = std::fs::File::create(temp_file).expect("Should create temp file");
+            file.write_all("Hello 世界 🦀 Rust!".as_bytes()).expect("Should write UTF-8");
+        }
+        
+        // Test reading it back
+        let content = std::fs::read_to_string(temp_file).expect("Should read UTF-8 content");
+        assert_eq!(content, "Hello 世界 🦀 Rust!");
+        
+        // Clean up
+        std::fs::remove_file(temp_file).ok();
+    }
 }
