@@ -26,6 +26,9 @@ use sha2::{Sha256, Digest};
 use glob::glob;
 use jwalk::WalkDir;
 use rayon::prelude::*;
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use lz4_flex::{compress_prepend_size, decompress_size_prepended};
+use std::io::Write;
 
 // Debug output control
 fn debug_enabled() -> bool {
@@ -1157,6 +1160,264 @@ impl VScalar for PathPartsScalar {
     }
 }
 
+// Compression algorithms enum
+#[derive(Debug, Clone)]
+enum CompressionAlgorithm {
+    Gzip,
+    Lz4,
+    Zstd,
+}
+
+impl CompressionAlgorithm {
+    fn from_str(s: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        match s.to_lowercase().as_str() {
+            "gzip" | "gz" => Ok(CompressionAlgorithm::Gzip),
+            "lz4" => Ok(CompressionAlgorithm::Lz4),
+            "zstd" | "zst" => Ok(CompressionAlgorithm::Zstd),
+            _ => Err(format!("Unsupported compression algorithm: {}", s).into()),
+        }
+    }
+    
+    fn detect_from_header(data: &[u8]) -> Option<Self> {
+        if data.len() < 4 {
+            return None;
+        }
+        
+        // GZIP magic number: 1f 8b
+        if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+            return Some(CompressionAlgorithm::Gzip);
+        }
+        
+        // ZSTD magic number: 28 b5 2f fd
+        if data.len() >= 4 && data[0] == 0x28 && data[1] == 0xb5 && data[2] == 0x2f && data[3] == 0xfd {
+            return Some(CompressionAlgorithm::Zstd);
+        }
+        
+        // LZ4 with size-prepended format: we can try to decompress and see if it works
+        // For now, we'll assume it's LZ4 if it's not GZIP or ZSTD and has reasonable size
+        if data.len() >= 8 {
+            // Try to read the prepended size (first 4 bytes) and see if it's reasonable
+            let size_bytes = [data[0], data[1], data[2], data[3]];
+            let uncompressed_size = u32::from_le_bytes(size_bytes);
+            
+            // Heuristic: if the uncompressed size seems reasonable (not too huge)
+            // and we have enough compressed data, assume it's LZ4
+            if uncompressed_size > 0 && uncompressed_size < 100_000_000 && data.len() > 4 {
+                return Some(CompressionAlgorithm::Lz4);
+            }
+        }
+        
+        None
+    }
+}
+
+// Compress scalar function
+struct CompressScalar;
+
+impl VScalar for CompressScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let data_vector = input.flat_vector(0);
+        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        // For now, default to GZIP (algorithm parameter support will be added later)
+        let algorithm = CompressionAlgorithm::Gzip;
+        
+        let output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut input_duck_string = data_slice[i];
+            let mut input_str = DuckString::new(&mut input_duck_string);
+            let input_bytes = input_str.as_bytes();
+            
+            let compressed_data = match algorithm {
+                CompressionAlgorithm::Gzip => compress_gzip(input_bytes)?,
+                CompressionAlgorithm::Lz4 => compress_lz4(input_bytes)?,
+                CompressionAlgorithm::Zstd => compress_zstd(input_bytes)?,
+            };
+            
+            output_vector.insert(i, compressed_data.as_slice());
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            // compress(data BLOB) -> BLOB (GZIP algorithm)
+            ScalarFunctionSignature::exact(
+                vec![LogicalTypeHandle::from(LogicalTypeId::Blob)],
+                LogicalTypeHandle::from(LogicalTypeId::Blob),
+            ),
+        ]
+    }
+}
+
+// Decompress scalar function
+struct DecompressScalar;
+
+impl VScalar for DecompressScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let data_vector = input.flat_vector(0);
+        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        // For now, auto-detect algorithm from data
+        let explicit_algorithm: Option<CompressionAlgorithm> = None;
+        
+        let output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut input_duck_string = data_slice[i];
+            let mut input_str = DuckString::new(&mut input_duck_string);
+            let input_bytes = input_str.as_bytes();
+            
+            // Determine algorithm: explicit parameter or auto-detect
+            let algorithm = if let Some(algo) = explicit_algorithm.clone() {
+                algo
+            } else {
+                // Auto-detect from header
+                CompressionAlgorithm::detect_from_header(input_bytes)
+                    .unwrap_or(CompressionAlgorithm::Gzip) // Default to GZIP if can't detect
+            };
+            
+            let decompressed_data = match algorithm {
+                CompressionAlgorithm::Gzip => decompress_gzip(input_bytes)?,
+                CompressionAlgorithm::Lz4 => decompress_lz4(input_bytes)?,
+                CompressionAlgorithm::Zstd => decompress_zstd(input_bytes)?,
+            };
+            
+            output_vector.insert(i, decompressed_data.as_slice());
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            // decompress(data BLOB) -> BLOB (auto-detect algorithm)
+            ScalarFunctionSignature::exact(
+                vec![LogicalTypeHandle::from(LogicalTypeId::Blob)],
+                LogicalTypeHandle::from(LogicalTypeId::Blob),
+            ),
+        ]
+    }
+}
+
+// Compression implementation functions
+fn compress_gzip(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data)?;
+    Ok(encoder.finish()?)
+}
+
+fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut decoder = GzDecoder::new(data);
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result)?;
+    Ok(result)
+}
+
+fn compress_lz4(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    Ok(compress_prepend_size(data))
+}
+
+fn decompress_lz4(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    decompress_size_prepended(data).map_err(|e| format!("LZ4 decompression failed: {}", e).into())
+}
+
+fn compress_zstd(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    zstd::encode_all(data, 3).map_err(|e| format!("ZSTD compression failed: {}", e).into())
+}
+
+fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    zstd::decode_all(data).map_err(|e| format!("ZSTD decompression failed: {}", e).into())
+}
+
+// ZSTD-specific compression function  
+struct CompressZstdScalar;
+
+impl VScalar for CompressZstdScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let data_vector = input.flat_vector(0);
+        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        let output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut input_duck_string = data_slice[i];
+            let mut input_str = DuckString::new(&mut input_duck_string);
+            let input_bytes = input_str.as_bytes();
+            
+            let compressed_data = compress_zstd(input_bytes)?;
+            output_vector.insert(i, compressed_data.as_slice());
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            ScalarFunctionSignature::exact(
+                vec![LogicalTypeHandle::from(LogicalTypeId::Blob)],
+                LogicalTypeHandle::from(LogicalTypeId::Blob),
+            ),
+        ]
+    }
+}
+
+// LZ4-specific compression function (speed-optimized)
+struct CompressLz4Scalar;
+
+impl VScalar for CompressLz4Scalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let data_vector = input.flat_vector(0);
+        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        let output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut input_duck_string = data_slice[i];
+            let mut input_str = DuckString::new(&mut input_duck_string);
+            let input_bytes = input_str.as_bytes();
+            
+            let compressed_data = compress_lz4(input_bytes)?;
+            output_vector.insert(i, compressed_data.as_slice());
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            ScalarFunctionSignature::exact(
+                vec![LogicalTypeHandle::from(LogicalTypeId::Blob)],
+                LogicalTypeHandle::from(LogicalTypeId::Blob),
+            ),
+        ]
+    }
+}
+
 #[derive(Debug)]
 struct PathComponents {
     drive: String,
@@ -1547,6 +1808,19 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     
     con.register_scalar_function::<BlobSubstrScalar>("blob_substr")
         .expect("Failed to register blob_substr scalar function for BLOB");
+    
+    con.register_scalar_function::<CompressScalar>("compress")
+        .expect("Failed to register compress scalar function");
+    
+    con.register_scalar_function::<DecompressScalar>("decompress")
+        .expect("Failed to register decompress scalar function");
+    
+    // Algorithm-specific compression functions
+    con.register_scalar_function::<CompressZstdScalar>("compress_zstd")
+        .expect("Failed to register compress_zstd scalar function");
+    
+    con.register_scalar_function::<CompressLz4Scalar>("compress_lz4")
+        .expect("Failed to register compress_lz4 scalar function");
     
     Ok(())
 }

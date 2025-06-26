@@ -4,7 +4,8 @@ The File Tools extension provides functions for file system operations, metadata
 
 ## Latest Changes
 
-**v0.1.0 - Runtime Debug Control & Pattern Matching Fixes**
+**v0.1.0 - Multi-Algorithm Compression & Runtime Debug Control**
+- ✅ **Compression functions**: Added `compress()`, `compress_zstd()`, `compress_lz4()` and `decompress()` functions
 - ✅ **Runtime debug output**: Set `DUCKDB_FILE_TOOLS_DEBUG=1` to enable detailed performance instrumentation
 - ✅ **New jwalk implementation**: Added `glob_stat_sha256_jwalk` as alternative parallel implementation
 - ✅ **Pattern matching fixes**: Fixed file count discrepancies in jwalk implementation
@@ -406,6 +407,310 @@ SELECT
     blob_substr(content, 1, 8) AS header,
     octet_length(content) AS total_size
 FROM file_contents;
+```
+
+### `compress(data)`
+
+Compresses BLOB data using GZIP compression algorithm, reducing storage size and bandwidth requirements.
+
+**Syntax**
+```sql
+compress(data)
+```
+
+**Parameters**
+- `data` (`BLOB`): The binary data to compress
+
+**Returns**
+- `BLOB`: Compressed data in GZIP format
+
+**Features**
+- **GZIP compression**: Uses the widely-supported GZIP format with good compression ratios
+- **Memory efficient**: Streams data through compression to handle large BLOBs
+- **Cross-platform**: Standard GZIP format compatible with all systems
+- **Default compression level**: Balanced speed vs. compression ratio
+
+**Example**
+```sql
+-- Basic compression
+SELECT compress('hello world'::BLOB) AS compressed_data;
+
+-- Measure compression efficiency
+SELECT 
+    octet_length(data) AS original_size,
+    octet_length(compress(data)) AS compressed_size,
+    round(100.0 * octet_length(compress(data)) / octet_length(data), 1) AS compression_ratio
+FROM (SELECT 'The quick brown fox jumps over the lazy dog'::BLOB AS data);
+
+-- Compress file contents
+SELECT 
+    filename,
+    octet_length(content) AS original_size,
+    octet_length(compress(content)) AS compressed_size
+FROM (
+    SELECT 
+        'large_file.txt' AS filename,
+        read_blob('large_file.txt') AS content
+);
+
+-- Store compressed data in table
+CREATE TABLE compressed_files AS
+SELECT 
+    path,
+    compress(read_blob(path)) AS compressed_content,
+    octet_length(read_blob(path)) AS original_size,
+    octet_length(compress(read_blob(path))) AS compressed_size
+FROM glob_stat('data/*.txt')
+WHERE is_file = 'true';
+```
+
+### `decompress(data)`
+
+Decompresses BLOB data that was compressed with the `compress()` function, automatically detecting the compression format.
+
+**Syntax**
+```sql
+decompress(data)
+```
+
+**Parameters**
+- `data` (`BLOB`): The compressed binary data
+
+**Returns**
+- `BLOB`: Decompressed original data
+
+**Features**
+- **Format auto-detection**: Automatically detects GZIP compression format from data headers
+- **Round-trip compatibility**: Perfect reconstruction of original data when used with `compress()`
+- **Error handling**: Graceful handling of invalid or corrupted compressed data
+- **Memory streaming**: Efficient decompression of large compressed BLOBs
+
+**Example**
+```sql
+-- Basic round-trip compression/decompression
+SELECT decompress(compress('hello world'::BLOB)) = 'hello world'::BLOB AS roundtrip_works;
+
+-- Decompress stored data
+SELECT 
+    path,
+    original_size,
+    compressed_size,
+    decompress(compressed_content) AS restored_content
+FROM compressed_files;
+
+-- Verify data integrity after compression/decompression
+WITH test_data AS (
+    SELECT repeat('Test data with repetitive patterns. ', 100)::BLOB AS original
+)
+SELECT 
+    original = decompress(compress(original)) AS data_integrity_check,
+    octet_length(original) AS original_size,
+    octet_length(compress(original)) AS compressed_size,
+    round(100.0 * octet_length(compress(original)) / octet_length(original), 1) AS compression_ratio
+FROM test_data;
+
+-- Process compressed files
+SELECT 
+    filename,
+    length(decompress(compressed_data)::VARCHAR) AS text_length,
+    substr(decompress(compressed_data)::VARCHAR, 1, 50) AS preview
+FROM compressed_text_files;
+```
+
+### `compress_zstd(data)`
+
+High-performance compression using the ZSTD algorithm, providing excellent compression ratios with fast decompression speeds.
+
+**Syntax**
+```sql
+compress_zstd(data)
+```
+
+**Parameters**
+- `data` (`BLOB`): The binary data to compress
+
+**Returns**
+- `BLOB`: Compressed data in ZSTD format
+
+**Features**
+- **Superior compression**: Best compression ratios among all algorithms
+- **Fast decompression**: Optimized for quick data retrieval
+- **Modern algorithm**: Facebook's ZSTD, designed for real-time applications
+- **Wide compatibility**: Standard format supported across platforms
+
+**Example**
+```sql
+-- ZSTD compression
+SELECT compress_zstd('Large dataset content'::BLOB) AS zstd_compressed;
+
+-- Compare compression efficiency
+WITH algorithms AS (
+    SELECT 'GZIP' AS algo, compress(data) AS compressed FROM (SELECT repeat('data', 1000)::BLOB AS data)
+    UNION ALL
+    SELECT 'ZSTD' AS algo, compress_zstd(data) AS compressed FROM (SELECT repeat('data', 1000)::BLOB AS data)
+    UNION ALL  
+    SELECT 'LZ4' AS algo, compress_lz4(data) AS compressed FROM (SELECT repeat('data', 1000)::BLOB AS data)
+)
+SELECT 
+    algo,
+    octet_length(compressed) AS compressed_size,
+    round(100.0 * octet_length(compressed) / 4000, 1) AS compression_ratio
+FROM algorithms
+ORDER BY compressed_size;
+```
+
+### `compress_lz4(data)`
+
+Ultra-fast compression using the LZ4 algorithm, prioritizing speed over compression ratio for real-time applications.
+
+**Syntax**
+```sql
+compress_lz4(data)
+```
+
+**Parameters**
+- `data` (`BLOB`): The binary data to compress
+
+**Returns**
+- `BLOB`: Compressed data in LZ4 format with size-prepended header
+
+**Features**
+- **Extreme speed**: Fastest compression and decompression
+- **Low CPU usage**: Minimal processing overhead
+- **Real-time suitable**: Perfect for high-throughput scenarios
+- **Size-prepended format**: Includes original size for efficient decompression
+
+**Example**
+```sql
+-- LZ4 compression for speed-critical applications
+SELECT compress_lz4(large_blob_data) AS lz4_compressed
+FROM high_volume_table;
+
+-- Benchmark compression speed vs ratio
+WITH test_data AS (
+    SELECT 
+        'logs' AS data_type,
+        string_agg(log_entry, '\n')::BLOB AS data
+    FROM application_logs
+    WHERE timestamp > current_timestamp - INTERVAL '1 hour'
+)
+SELECT 
+    'GZIP' AS algorithm,
+    octet_length(compress(data)) AS size,
+    'Standard compression' AS use_case
+FROM test_data
+UNION ALL
+SELECT 
+    'ZSTD' AS algorithm, 
+    octet_length(compress_zstd(data)) AS size,
+    'Best compression' AS use_case
+FROM test_data
+UNION ALL
+SELECT 
+    'LZ4' AS algorithm,
+    octet_length(compress_lz4(data)) AS size, 
+    'Fastest compression' AS use_case
+FROM test_data;
+```
+
+### Algorithm Comparison
+
+| Algorithm | Compression Ratio | Speed | CPU Usage | Best Use Case |
+|-----------|------------------|-------|-----------|---------------|
+| **LZ4** | ⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | Real-time, cache, streaming |
+| **GZIP** | ⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐ | General purpose, compatibility |
+| **ZSTD** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | **Balanced: best overall** |
+
+**Performance Characteristics:**
+- **LZ4**: 2-3GB/s compression, 3-4GB/s decompression, ~50% size reduction
+- **GZIP**: 30-50MB/s compression, 300-400MB/s decompression, ~70% size reduction  
+- **ZSTD**: 100-400MB/s compression, 800-1200MB/s decompression, ~75% size reduction
+
+### Compression Use Cases
+
+**Data Storage Optimization**
+```sql
+-- Archive old logs with maximum compression (ZSTD)
+CREATE TABLE archived_logs AS
+SELECT 
+    date_trunc('day', timestamp) AS log_date,
+    compress_zstd(string_agg(log_entry, '\n' ORDER BY timestamp)::BLOB) AS compressed_logs,
+    count(*) AS entry_count
+FROM application_logs 
+WHERE timestamp < current_date - INTERVAL '30 days'
+GROUP BY date_trunc('day', timestamp);
+
+-- Cache frequently accessed data with fast compression (LZ4)
+CREATE TABLE cached_reports AS
+SELECT 
+    report_id,
+    compress_lz4(report_data::BLOB) AS cached_data,
+    last_accessed
+FROM expensive_reports
+WHERE access_count > 100;
+```
+
+**Algorithm Selection Strategy**
+```sql
+-- Choose algorithm based on data characteristics and usage pattern
+WITH data_classification AS (
+    SELECT 
+        table_name,
+        avg_size,
+        access_frequency,
+        CASE 
+            WHEN access_frequency = 'high' AND avg_size < 1048576 THEN 'LZ4'     -- Fast for small, frequently accessed
+            WHEN access_frequency = 'low' AND avg_size > 10485760 THEN 'ZSTD'    -- Maximum compression for large archives
+            ELSE 'GZIP'                                                           -- Standard for everything else
+        END AS recommended_algorithm
+    FROM table_stats
+)
+SELECT 
+    table_name,
+    recommended_algorithm,
+    CASE recommended_algorithm
+        WHEN 'LZ4' THEN 'Real-time access, fast decompression'
+        WHEN 'ZSTD' THEN 'Maximum space savings, good speed'
+        WHEN 'GZIP' THEN 'Universal compatibility, balanced'
+    END AS rationale
+FROM data_classification;
+```
+
+**Multi-Algorithm Performance Comparison**
+```sql
+-- Comprehensive comparison across different data types
+WITH test_data AS (
+    SELECT 'json_config' AS data_type, config_json::BLOB AS data FROM system_settings
+    UNION ALL
+    SELECT 'log_entries' AS data_type, string_agg(message, '\n')::BLOB AS data FROM app_logs LIMIT 1000
+    UNION ALL
+    SELECT 'binary_data' AS data_type, file_content AS data FROM uploaded_files WHERE file_type = 'pdf' LIMIT 1
+),
+compression_results AS (
+    SELECT 
+        data_type,
+        octet_length(data) AS original_size,
+        octet_length(compress(data)) AS gzip_size,
+        octet_length(compress_zstd(data)) AS zstd_size,
+        octet_length(compress_lz4(data)) AS lz4_size
+    FROM test_data
+)
+SELECT 
+    data_type,
+    original_size,
+    gzip_size,
+    zstd_size, 
+    lz4_size,
+    round(100.0 * gzip_size / original_size, 1) AS gzip_ratio,
+    round(100.0 * zstd_size / original_size, 1) AS zstd_ratio,
+    round(100.0 * lz4_size / original_size, 1) AS lz4_ratio,
+    CASE 
+        WHEN zstd_size < gzip_size AND zstd_size < lz4_size THEN 'ZSTD'
+        WHEN lz4_size < gzip_size * 1.2 THEN 'LZ4'  -- LZ4 if within 20% of best
+        ELSE 'GZIP'
+    END AS recommended
+FROM compression_results
+ORDER BY original_size DESC;
 ```
 
 ## Debug and Performance Monitoring

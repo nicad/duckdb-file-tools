@@ -155,7 +155,6 @@ SELECT filename, path_parts(filename) FROM glob('/home/user/**/*.log');
 SELECT filename FROM glob('/home/user/**/*.log') WHERE path_parts(filename).suffix = '.csv';
 ```
 
-
 ### glob_stat_sha256() Function Signature
 
 Similar to glob_stat but adds a sha256.
@@ -196,11 +195,36 @@ FROM glob_stat('/tmp/**/*')
 WHERE size > 1000000 AND modified_time > '2024-01-01';
 ```
 
+### compress() and decompress() Function Signature
+
+```sql
+compress(data BLOB)
+→ BLOB
+
+decompress(data BLOB)
+→ BLOB
+```
+
+They are scalar functions.
+
+### Parameters
+- `data` (BLOB): a literal or column to compress
+
+### Usage Examples
+```sql
+SELECT compress('hello world');
+
+SELECT
+    decompress(data)
+FROM (
+    SELECT compress(text_file(filename)) as data
+    FROM glob('/data/*.log')
+);
+```
+
 ### Implementation considerations
 
-The most important part is to make it efficient AND parallel WITHIN this function. Calling glob() and file_sha256 is very slow somehow. We want very aggressive parallelism so doing a full scan of a lot of data is very fast.
-
-Also what we want to do if there is an easy way in Rust is to memory map the file to avoid chunking considerations. We need to discuss this before implementing it.
+TODO: what compression method to use ? should it be pluggable ? what is a good rust library to include that doesn't add too much bloat ?
 
 ## Technical Architecture
 
@@ -304,3 +328,14 @@ You can also find duckdb itself at docs/other-extensions/duckdb but because it's
 - Accurate metadata collection across platforms
 - Reliable hash computation for various file sizes
 - Clean integration with DuckDB query patterns
+
+## Development, debugging and troubleshooting
+
+```bash
+duckdb -unsigned -cmd " LOAD './build/debug/file_tools.duckdb_extension';"
+DUCKDB_FILE_TOOLS_DEBUG=1 duckdb -unsigned -cmd "load './build/debug/file_tools.duckdb_extension';"
+duckdb -unsigned -cmd "load './build/release/file_tools.duckdb_extension';"
+
+select * from glob_stat_sha256_parallel('/Users/nicolas/Downloads/*.pdf');
+select * from glob_stat_sha256_jwalk('/Users/nicolas/Downloads/*.pdf');
+```
