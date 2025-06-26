@@ -3,34 +3,31 @@
 [![Build Status](https://github.com/yourusername/duckdb-file-tools/workflows/CI/badge.svg)](https://github.com/yourusername/duckdb-file-tools/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A high-performance DuckDB extension written in Rust that provides comprehensive file system operations, metadata extraction, compression, and planned Age encryption support.
+A DuckDB extension written in Rust that provides file system operations, metadata extraction, compression, and planned Age encryption support.
+
+Vibe coded so use at your discretion. Not tested much yet.
 
 ## Features
 
-🚀 **High-Performance File Operations**
+**File Operations**
 - Parallel file scanning with multi-threaded hash computation
 - Memory-efficient streaming for large files
 - Cross-platform path handling (Windows, Unix, macOS)
 
-📊 **Comprehensive File Metadata** 
+**File Metadata**
 - File size, timestamps (created, modified, accessed)
 - Permissions, inode numbers, file type detection
 - Path decomposition and analysis
 
-🗜️ **Multi-Algorithm Compression**
+**Multi-Algorithm Compression**
 - GZIP (balanced), ZSTD (best compression), LZ4 (fastest)
 - Automatic format detection for decompression
 - Optimized for different use cases
 
-🔍 **Content Analysis**
+**Content Analysis**
 - SHA256 hash computation with streaming support
 - BLOB manipulation and substring extraction
 - Binary file header analysis
-
-🛠️ **Advanced Features**
-- Runtime debug instrumentation for performance analysis
-- Glob pattern matching with normalization
-- Error-resilient processing with detailed logging
 
 ## Quick Start
 
@@ -106,9 +103,10 @@ FROM (SELECT 'Large text data...'::BLOB as data);
 | Function | Purpose | Performance |
 |----------|---------|-------------|
 | `glob_stat(pattern)` | File metadata collection | Standard |
-| `file_path_sha256(pattern)` | Files with SHA256 hashes | Standard |  
 | `glob_stat_sha256_parallel(pattern)` | **High-performance** parallel hashing | **Fast** |
 | `glob_stat_sha256_jwalk(pattern)` | Alternative parallel implementation | **Fast** |
+
+warning: `glob_stat_sha256_*` compute full file checksum, even though it is performed in parallel it can take a long time on big files and/or big directories. It should outperform using `glob` with `file_sha256` that doesn't seem parallelized (more testing needed).
 
 ### Scalar Functions
 
@@ -125,7 +123,9 @@ FROM (SELECT 'Large text data...'::BLOB as data);
 
 ## Performance
 
-### Compression Benchmarks
+### Compression Estimations
+
+not verified.
 
 | Algorithm | Compression Ratio | Speed | Best Use Case |
 |-----------|------------------|--------|---------------|
@@ -266,6 +266,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
+- mostly coded by Claude Code
 - Built on the [DuckDB Rust Extension Template](https://github.com/duckdb/duckdb-extension-template-rs)
 - Uses the excellent [jwalk](https://github.com/Byron/jwalk) crate for parallel directory traversal
 - Compression powered by [flate2](https://github.com/rust-lang/flate2-rs), [zstd](https://github.com/gyscos/zstd-rs), and [lz4_flex](https://github.com/PSeitz/lz4_flex)
