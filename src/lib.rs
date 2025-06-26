@@ -19,11 +19,26 @@ use std::{
     io::Read,
     path::Path,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    time::SystemTime,
+    time::{SystemTime, Instant},
+    env,
 };
 use sha2::{Sha256, Digest};
 use glob::glob;
+use jwalk::WalkDir;
 use rayon::prelude::*;
+
+// Debug output control
+fn debug_enabled() -> bool {
+    env::var("DUCKDB_FILE_TOOLS_DEBUG").unwrap_or_default() == "1"
+}
+
+macro_rules! debug_println {
+    ($($arg:tt)*) => {
+        if debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 #[derive(Debug, Clone)]
 struct FileMetadata {
@@ -507,31 +522,82 @@ impl VTab for GlobStatSha256ParallelVTab {
 }
 
 fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
-    // Step 1: Use the existing glob crate to find files (just like the regular glob_stat)
+    let total_start = Instant::now();
+    debug_println!("[PERF] Starting parallel collection for pattern: {}", pattern);
+    
+    // Step 1: Pattern normalization and glob expansion
+    let glob_start = Instant::now();
     let rust_pattern = normalize_glob_pattern(pattern);
+    debug_println!("[PERF] Normalized pattern: {} -> {}", pattern, rust_pattern);
+    
     let file_paths: Vec<_> = glob(&rust_pattern)?
         .filter_map(|entry| entry.ok())
         .collect();
+    
+    let glob_duration = glob_start.elapsed();
+    debug_println!("[PERF] Glob expansion took: {:?}, found {} paths", glob_duration, file_paths.len());
+    
+    if file_paths.is_empty() {
+        debug_println!("[PERF] No files found, returning empty result");
+        return Ok(Vec::new());
+    }
+
+    // Count files vs directories for analysis
+    let metadata_count_start = Instant::now();
+    let (file_count, dir_count, error_count) = file_paths
+        .par_iter()
+        .map(|path| {
+            match fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.is_file() { (1, 0, 0) }
+                    else if meta.is_dir() { (0, 1, 0) }
+                    else { (0, 0, 0) }
+                }
+                Err(_) => (0, 0, 1)
+            }
+        })
+        .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+    
+    let metadata_count_duration = metadata_count_start.elapsed();
+    debug_println!("[PERF] Quick metadata scan took: {:?}", metadata_count_duration);
+    debug_println!("[PERF] Found {} files, {} directories, {} errors", file_count, dir_count, error_count);
 
     // Step 2: Parallel metadata extraction and hash computation using rayon
+    let parallel_start = Instant::now();
+    debug_println!("[PERF] Starting parallel processing with {} threads", rayon::current_num_threads());
+    
     let files: Vec<FileMetadata> = file_paths
         .into_par_iter()
         .filter_map(|path| {
+            let item_start = Instant::now();
+            
             // Get metadata first - use robust error handling like the sequential version
             let metadata = match fs::metadata(&path) {
                 Ok(meta) => meta,
                 Err(_) => return None, // Skip files we can't access
             };
+            
+            let metadata_duration = item_start.elapsed();
 
             // Compute hash in parallel for files only
+            let hash_start = Instant::now();
             let hash = if metadata.is_file() {
-                match compute_file_hash_streaming(&path) {
+                match compute_file_hash_streaming_instrumented(&path) {
                     Ok(h) => Some(h),
                     Err(_) => None,
                 }
             } else {
                 None
             };
+            let hash_duration = hash_start.elapsed();
+            
+            let total_item_duration = item_start.elapsed();
+            
+            // Log timing for slower items (> 100ms)
+            if total_item_duration.as_millis() > 100 {
+                debug_println!("[PERF] Slow item: {} took {:?} (metadata: {:?}, hash: {:?})", 
+                    path.display(), total_item_duration, metadata_duration, hash_duration);
+            }
 
             Some(FileMetadata {
                 path: path.to_string_lossy().to_string(),
@@ -557,7 +623,317 @@ fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata
         })
         .collect();
 
+    let parallel_duration = parallel_start.elapsed();
+    let total_duration = total_start.elapsed();
+    
+    debug_println!("[PERF] Parallel processing took: {:?}", parallel_duration);
+    debug_println!("[PERF] Total operation took: {:?}", total_duration);
+    debug_println!("[PERF] Processed {} items, returned {} results", file_count + dir_count, files.len());
+    debug_println!("[PERF] Average time per item: {:?}", 
+        if files.len() > 0 { parallel_duration / files.len() as u32 } else { parallel_duration });
+
     Ok(files)
+}
+
+// JWalk-based parallel implementation using parallel directory walking
+#[repr(C)]
+struct GlobStatSha256JwalkBindData {
+    pattern: String,
+    files: Vec<FileMetadata>,
+}
+
+#[repr(C)]
+struct GlobStatSha256JwalkInitData {
+    current_index: AtomicUsize,
+}
+
+struct GlobStatSha256JwalkVTab;
+
+impl VTab for GlobStatSha256JwalkVTab {
+    type InitData = GlobStatSha256JwalkInitData;
+    type BindData = GlobStatSha256JwalkBindData;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        // Same column structure as the regular glob_stat_sha256
+        bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("size", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("modified_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("accessed_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("created_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("permissions", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("inode", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("is_file", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("is_dir", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("is_symlink", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("hash", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+
+        let pattern = bind.get_parameter(0).to_string();
+
+        // Use jwalk for parallel directory walking
+        let files = collect_files_with_jwalk_parallel(&pattern)?;
+
+        Ok(GlobStatSha256JwalkBindData {
+            pattern,
+            files,
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(GlobStatSha256JwalkInitData {
+            current_index: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn std::error::Error>> {
+        let init_data = func.get_init_data();
+        let bind_data = func.get_bind_data();
+
+        let current_idx = init_data.current_index.load(Ordering::Relaxed);
+        
+        if current_idx >= bind_data.files.len() {
+            output.set_len(0);
+            return Ok(());
+        }
+
+        let file_meta = &bind_data.files[current_idx];
+        
+        // Insert data into output vectors (same as existing implementation)
+        output.flat_vector(0).insert(0, file_meta.path.as_str());
+        output.flat_vector(1).insert(0, file_meta.size.to_string().as_str());
+        output.flat_vector(2).insert(0, file_meta.modified_time.to_string().as_str());
+        output.flat_vector(3).insert(0, file_meta.accessed_time.to_string().as_str());
+        output.flat_vector(4).insert(0, file_meta.created_time.to_string().as_str());
+        output.flat_vector(5).insert(0, file_meta.permissions.as_str());
+        output.flat_vector(6).insert(0, file_meta.inode.to_string().as_str());
+        output.flat_vector(7).insert(0, if file_meta.is_file { "true" } else { "false" });
+        output.flat_vector(8).insert(0, if file_meta.is_dir { "true" } else { "false" });
+        output.flat_vector(9).insert(0, if file_meta.is_symlink { "true" } else { "false" });
+        
+        // Include hash if available
+        let hash_str = file_meta.hash.as_ref().map(|s| s.as_str()).unwrap_or("");
+        output.flat_vector(10).insert(0, hash_str);
+
+        output.set_len(1);
+        
+        init_data.current_index.store(current_idx + 1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    }
+}
+
+fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
+    let total_start = Instant::now();
+    debug_println!("[JWALK] Starting jwalk collection for pattern: {}", pattern);
+    
+    // First, let's compare with the exact same glob pattern that the parallel version uses
+    let rust_pattern = normalize_glob_pattern(pattern);
+    debug_println!("[JWALK] Using normalized pattern: {} -> {}", pattern, rust_pattern);
+    
+    // Parse pattern for jwalk base directory
+    let (base_dir, _) = parse_glob_pattern_for_jwalk(pattern)?;
+    debug_println!("[JWALK] Base directory: {}, will filter with glob pattern: {}", base_dir, rust_pattern);
+    
+    // Step 1: Parallel directory walking with jwalk
+    let walk_start = Instant::now();
+    
+    // Collect all paths first, then apply the exact same filtering as the glob-based version
+    let all_paths: Vec<_> = WalkDir::new(base_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    
+    debug_println!("[JWALK] Directory walk found {} total paths", all_paths.len());
+    
+    // Apply the same glob pattern matching as the parallel version
+    let glob_pattern = glob::Pattern::new(&rust_pattern)?;
+    let matching_paths: Vec<_> = all_paths
+        .into_iter()
+        .filter(|path| {
+            if let Some(path_str) = path.to_str() {
+                glob_pattern.matches(path_str)
+            } else {
+                false
+            }
+        })
+        .collect();
+    
+    // Debug: Compare with what the glob-based version would find
+    debug_println!("[JWALK] Comparing with glob crate results...");
+    let glob_results: Vec<_> = glob(&rust_pattern)?
+        .filter_map(|entry| entry.ok())
+        .collect();
+    
+    debug_println!("[JWALK] jwalk found: {} paths", matching_paths.len());
+    debug_println!("[JWALK] glob crate found: {} paths", glob_results.len());
+    
+    // Find differences
+    let jwalk_set: std::collections::HashSet<_> = matching_paths.iter().collect();
+    let glob_set: std::collections::HashSet<_> = glob_results.iter().collect();
+    
+    let only_in_jwalk: Vec<_> = jwalk_set.difference(&glob_set).collect();
+    let only_in_glob: Vec<_> = glob_set.difference(&jwalk_set).collect();
+    
+    if !only_in_jwalk.is_empty() {
+        debug_println!("[JWALK] Files only found by jwalk ({}):", only_in_jwalk.len());
+        for path in only_in_jwalk.iter().take(5) {
+            debug_println!("[JWALK]   + {}", path.display());
+        }
+        if only_in_jwalk.len() > 5 {
+            debug_println!("[JWALK]   ... and {} more", only_in_jwalk.len() - 5);
+        }
+    }
+    
+    if !only_in_glob.is_empty() {
+        debug_println!("[JWALK] Files only found by glob ({}):", only_in_glob.len());
+        for path in only_in_glob.iter().take(5) {
+            debug_println!("[JWALK]   - {}", path.display());
+        }
+        if only_in_glob.len() > 5 {
+            debug_println!("[JWALK]   ... and {} more", only_in_glob.len() - 5);
+        }
+    }
+    
+    // Use the same results as glob for accuracy
+    let matching_paths = glob_results;
+    
+    let walk_duration = walk_start.elapsed();
+    debug_println!("[JWALK] Parallel directory walk took: {:?}, found {} matching paths", walk_duration, matching_paths.len());
+    
+    if matching_paths.is_empty() {
+        debug_println!("[JWALK] No files found, returning empty result");
+        return Ok(Vec::new());
+    }
+
+    // Step 2: Count files vs directories
+    let count_start = Instant::now();
+    let (file_count, dir_count, error_count) = matching_paths
+        .par_iter()
+        .map(|path| {
+            match fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.is_file() { (1, 0, 0) }
+                    else if meta.is_dir() { (0, 1, 0) }
+                    else { (0, 0, 0) }
+                }
+                Err(_) => (0, 0, 1)
+            }
+        })
+        .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+    
+    let count_duration = count_start.elapsed();
+    debug_println!("[JWALK] Metadata count took: {:?}", count_duration);
+    debug_println!("[JWALK] Found {} files, {} directories, {} errors", file_count, dir_count, error_count);
+
+    // Step 3: Parallel metadata extraction and hash computation
+    let parallel_start = Instant::now();
+    debug_println!("[JWALK] Starting parallel processing with {} threads", rayon::current_num_threads());
+    
+    let files: Vec<FileMetadata> = matching_paths
+        .into_par_iter()
+        .filter_map(|path| {
+            let item_start = Instant::now();
+            
+            // Get metadata first
+            let metadata = match fs::metadata(&path) {
+                Ok(meta) => meta,
+                Err(_) => return None,
+            };
+            
+            let metadata_duration = item_start.elapsed();
+
+            // Compute hash in parallel for files only
+            let hash_start = Instant::now();
+            let hash = if metadata.is_file() {
+                match compute_file_hash_streaming_instrumented(&path) {
+                    Ok(h) => Some(h),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let hash_duration = hash_start.elapsed();
+            
+            let total_item_duration = item_start.elapsed();
+            
+            // Log timing for slower items (> 100ms)
+            if total_item_duration.as_millis() > 100 {
+                debug_println!("[JWALK] Slow item: {} took {:?} (metadata: {:?}, hash: {:?})", 
+                    path.display(), total_item_duration, metadata_duration, hash_duration);
+            }
+
+            Some(FileMetadata {
+                path: path.to_string_lossy().to_string(),
+                size: metadata.len(),
+                modified_time: system_time_to_microseconds(
+                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+                ),
+                accessed_time: system_time_to_microseconds(
+                    metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH)
+                ),
+                created_time: system_time_to_microseconds(
+                    metadata.created().unwrap_or_else(|_| 
+                        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+                    )
+                ),
+                permissions: format_permissions(&metadata),
+                inode: get_inode(&metadata),
+                is_file: metadata.is_file(),
+                is_dir: metadata.is_dir(),
+                is_symlink: metadata.file_type().is_symlink(),
+                hash,
+            })
+        })
+        .collect();
+
+    let parallel_duration = parallel_start.elapsed();
+    let total_duration = total_start.elapsed();
+    
+    debug_println!("[JWALK] Parallel processing took: {:?}", parallel_duration);
+    debug_println!("[JWALK] Total operation took: {:?}", total_duration);
+    debug_println!("[JWALK] Processed {} items, returned {} results", file_count + dir_count, files.len());
+    debug_println!("[JWALK] Average time per item: {:?}", 
+        if files.len() > 0 { parallel_duration / files.len() as u32 } else { parallel_duration });
+
+    Ok(files)
+}
+
+fn parse_glob_pattern_for_jwalk(pattern: &str) -> Result<(&str, String), Box<dyn Error>> {
+    // For jwalk, we need to extract the base directory and create a full glob pattern
+    if pattern.contains("**") {
+        // Recursive pattern
+        if pattern.starts_with('/') || pattern.starts_with("\\") {
+            // Absolute path with **
+            if let Some(star_pos) = pattern.find("**") {
+                let base_dir = if star_pos > 1 {
+                    &pattern[..star_pos-1] // Remove trailing slash before **
+                } else {
+                    "/"
+                };
+                Ok((base_dir, pattern.to_string()))
+            } else {
+                Ok((".", pattern.to_string()))
+            }
+        } else {
+            // Relative pattern with **
+            Ok((".", pattern.to_string()))
+        }
+    } else if pattern.contains('/') || pattern.contains('\\') {
+        // Pattern with directory but no **
+        let path = std::path::Path::new(pattern);
+        if let Some(parent) = path.parent() {
+            let parent_str = parent.to_str().unwrap_or(".");
+            Ok((parent_str, pattern.to_string()))
+        } else {
+            Ok((".", pattern.to_string()))
+        }
+    } else {
+        // Simple filename pattern
+        Ok((".", pattern.to_string()))
+    }
 }
 
 fn normalize_glob_pattern(pattern: &str) -> String {
@@ -1005,7 +1381,73 @@ fn get_file_metadata_json(filename: &str) -> Result<Option<String>, Box<dyn std:
     }
 }
 
-// Streaming SHA256 computation with adaptive chunk sizes
+// Instrumented version for performance analysis
+fn compute_file_hash_streaming_instrumented(path: &Path) -> Result<String, Box<dyn Error>> {
+    let start_time = Instant::now();
+    let mut file = std::fs::File::open(path)?;
+    let open_duration = start_time.elapsed();
+    
+    let metadata = file.metadata()?;
+    let file_size = metadata.len();
+    
+    let mut hasher = Sha256::new();
+    let mut total_bytes_read = 0u64;
+    let mut read_count = 0u32;
+    
+    // Adaptive chunk strategy: 1MB -> 2MB -> 4MB -> 8MB max
+    let mut chunk_size = 1024 * 1024; // Start with 1MB
+    const MAX_CHUNK_SIZE: usize = 8 * 1024 * 1024; // Max 8MB
+    
+    let hash_start = Instant::now();
+    loop {
+        let read_start = Instant::now();
+        let mut buffer = vec![0u8; chunk_size];
+        let bytes_read = file.read(&mut buffer)?;
+        let read_duration = read_start.elapsed();
+        
+        if bytes_read == 0 {
+            break; // EOF
+        }
+        
+        total_bytes_read += bytes_read as u64;
+        read_count += 1;
+        
+        // Log slow reads (> 50ms)
+        if read_duration.as_millis() > 50 {
+            debug_println!("[PERF] Slow read: {} bytes in {:?} from {}", 
+                bytes_read, read_duration, path.display());
+        }
+        
+        // Update hasher with the data we actually read
+        hasher.update(&buffer[..bytes_read]);
+        
+        // Double chunk size for next read (up to max)
+        if chunk_size < MAX_CHUNK_SIZE {
+            chunk_size = std::cmp::min(chunk_size * 2, MAX_CHUNK_SIZE);
+        }
+    }
+    
+    let result = hasher.finalize();
+    let total_duration = start_time.elapsed();
+    let hash_duration = hash_start.elapsed();
+    
+    // Log detailed stats for larger files (> 1MB) or slow operations (> 500ms)
+    if file_size > 1024 * 1024 || total_duration.as_millis() > 500 {
+        let throughput = if hash_duration.as_secs() > 0 {
+            (total_bytes_read as f64) / (1024.0 * 1024.0 * hash_duration.as_secs_f64())
+        } else {
+            0.0
+        };
+        
+        debug_println!("[PERF] Hash: {} ({} bytes) took {:?} (open: {:?}, hash: {:?}) {} reads, {:.1} MB/s", 
+            path.display(), file_size, total_duration, open_duration, hash_duration, 
+            read_count, throughput);
+    }
+    
+    Ok(format!("{:x}", result))
+}
+
+// Original streaming function without instrumentation
 fn compute_file_hash_streaming(path: &Path) -> Result<String, Box<dyn Error>> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -1090,6 +1532,9 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     
     con.register_table_function::<GlobStatSha256ParallelVTab>("glob_stat_sha256_parallel")
         .expect("Failed to register glob_stat_sha256_parallel table function");
+    
+    con.register_table_function::<GlobStatSha256JwalkVTab>("glob_stat_sha256_jwalk")
+        .expect("Failed to register glob_stat_sha256_jwalk table function");
     
     con.register_scalar_function::<FileStatScalar>("file_stat")
         .expect("Failed to register file_stat scalar function");
