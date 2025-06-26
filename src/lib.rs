@@ -29,6 +29,8 @@ use rayon::prelude::*;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use std::io::Write;
+use age::secrecy::{SecretString, ExposeSecret};
+use age::{x25519, scrypt};
 
 // Debug output control
 fn debug_enabled() -> bool {
@@ -77,15 +79,15 @@ impl VTab for GlobStatVTab {
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("size", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("modified_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("accessed_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("created_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("size", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        bind.add_result_column("modified_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
+        bind.add_result_column("accessed_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
+        bind.add_result_column("created_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
         bind.add_result_column("permissions", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("inode", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("is_file", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("is_dir", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("is_symlink", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("inode", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        bind.add_result_column("is_file", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+        bind.add_result_column("is_dir", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+        bind.add_result_column("is_symlink", LogicalTypeHandle::from(LogicalTypeId::Boolean));
 
         let pattern = bind.get_parameter(0).to_string();
 
@@ -117,35 +119,51 @@ impl VTab for GlobStatVTab {
 
         let file_meta = &bind_data.files[current_idx];
         
-        let path_str = CString::new(file_meta.path.clone())?;
-        output.flat_vector(0).insert(0, path_str);
+        // Path (VARCHAR)
+        output.flat_vector(0).insert(0, file_meta.path.as_str());
         
-        let size_str = CString::new(file_meta.size.to_string())?;
-        output.flat_vector(1).insert(0, size_str);
+        // Size (BIGINT)
+        let mut size_vector = output.flat_vector(1);
+        let size_data = size_vector.as_mut_slice::<i64>();
+        size_data[0] = file_meta.size as i64;
         
-        let modified_str = CString::new(file_meta.modified_time.to_string())?;
-        output.flat_vector(2).insert(0, modified_str);
+        // Modified time (TIMESTAMP)
+        let mut modified_vector = output.flat_vector(2);
+        let modified_data = modified_vector.as_mut_slice::<i64>();
+        modified_data[0] = file_meta.modified_time;
         
-        let accessed_str = CString::new(file_meta.accessed_time.to_string())?;
-        output.flat_vector(3).insert(0, accessed_str);
+        // Accessed time (TIMESTAMP)
+        let mut accessed_vector = output.flat_vector(3);
+        let accessed_data = accessed_vector.as_mut_slice::<i64>();
+        accessed_data[0] = file_meta.accessed_time;
         
-        let created_str = CString::new(file_meta.created_time.to_string())?;
-        output.flat_vector(4).insert(0, created_str);
+        // Created time (TIMESTAMP)
+        let mut created_vector = output.flat_vector(4);
+        let created_data = created_vector.as_mut_slice::<i64>();
+        created_data[0] = file_meta.created_time;
         
-        let permissions_str = CString::new(file_meta.permissions.clone())?;
-        output.flat_vector(5).insert(0, permissions_str);
+        // Permissions (VARCHAR)
+        output.flat_vector(5).insert(0, file_meta.permissions.as_str());
         
-        let inode_str = CString::new(file_meta.inode.to_string())?;
-        output.flat_vector(6).insert(0, inode_str);
+        // Inode (BIGINT)
+        let mut inode_vector = output.flat_vector(6);
+        let inode_data = inode_vector.as_mut_slice::<i64>();
+        inode_data[0] = file_meta.inode as i64;
         
-        let is_file_str = CString::new(file_meta.is_file.to_string())?;
-        output.flat_vector(7).insert(0, is_file_str);
+        // Is file (BOOLEAN)
+        let mut is_file_vector = output.flat_vector(7);
+        let is_file_data = is_file_vector.as_mut_slice::<bool>();
+        is_file_data[0] = file_meta.is_file;
         
-        let is_dir_str = CString::new(file_meta.is_dir.to_string())?;
-        output.flat_vector(8).insert(0, is_dir_str);
+        // Is directory (BOOLEAN)
+        let mut is_dir_vector = output.flat_vector(8);
+        let is_dir_data = is_dir_vector.as_mut_slice::<bool>();
+        is_dir_data[0] = file_meta.is_dir;
         
-        let is_symlink_str = CString::new(file_meta.is_symlink.to_string())?;
-        output.flat_vector(9).insert(0, is_symlink_str);
+        // Is symlink (BOOLEAN)
+        let mut is_symlink_vector = output.flat_vector(9);
+        let is_symlink_data = is_symlink_vector.as_mut_slice::<bool>();
+        is_symlink_data[0] = file_meta.is_symlink;
 
         output.set_len(1);
         init_data.current_index.store(current_idx + 1, Ordering::Relaxed);
@@ -454,17 +472,17 @@ impl VTab for GlobStatSha256ParallelVTab {
     type BindData = GlobStatSha256ParallelBindData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        // Same column structure as the regular glob_stat_sha256
+        // Column structure with proper types
         bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("size", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("modified_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("accessed_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("created_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("size", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        bind.add_result_column("modified_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
+        bind.add_result_column("accessed_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
+        bind.add_result_column("created_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
         bind.add_result_column("permissions", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("inode", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("is_file", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("is_dir", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("is_symlink", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("inode", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        bind.add_result_column("is_file", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+        bind.add_result_column("is_dir", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+        bind.add_result_column("is_symlink", LogicalTypeHandle::from(LogicalTypeId::Boolean));
         bind.add_result_column("hash", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
         let pattern = bind.get_parameter(0).to_string();
@@ -497,17 +515,51 @@ impl VTab for GlobStatSha256ParallelVTab {
 
         let file_meta = &bind_data.files[current_idx];
         
-        // Insert data into output vectors (same as existing implementation)
+        // Path (VARCHAR)
         output.flat_vector(0).insert(0, file_meta.path.as_str());
-        output.flat_vector(1).insert(0, file_meta.size.to_string().as_str());
-        output.flat_vector(2).insert(0, file_meta.modified_time.to_string().as_str());
-        output.flat_vector(3).insert(0, file_meta.accessed_time.to_string().as_str());
-        output.flat_vector(4).insert(0, file_meta.created_time.to_string().as_str());
+        
+        // Size (BIGINT)
+        let mut size_vector = output.flat_vector(1);
+        let size_data = size_vector.as_mut_slice::<i64>();
+        size_data[0] = file_meta.size as i64;
+        
+        // Modified time (TIMESTAMP)
+        let mut modified_vector = output.flat_vector(2);
+        let modified_data = modified_vector.as_mut_slice::<i64>();
+        modified_data[0] = file_meta.modified_time;
+        
+        // Accessed time (TIMESTAMP)
+        let mut accessed_vector = output.flat_vector(3);
+        let accessed_data = accessed_vector.as_mut_slice::<i64>();
+        accessed_data[0] = file_meta.accessed_time;
+        
+        // Created time (TIMESTAMP)
+        let mut created_vector = output.flat_vector(4);
+        let created_data = created_vector.as_mut_slice::<i64>();
+        created_data[0] = file_meta.created_time;
+        
+        // Permissions (VARCHAR)
         output.flat_vector(5).insert(0, file_meta.permissions.as_str());
-        output.flat_vector(6).insert(0, file_meta.inode.to_string().as_str());
-        output.flat_vector(7).insert(0, if file_meta.is_file { "true" } else { "false" });
-        output.flat_vector(8).insert(0, if file_meta.is_dir { "true" } else { "false" });
-        output.flat_vector(9).insert(0, if file_meta.is_symlink { "true" } else { "false" });
+        
+        // Inode (BIGINT)
+        let mut inode_vector = output.flat_vector(6);
+        let inode_data = inode_vector.as_mut_slice::<i64>();
+        inode_data[0] = file_meta.inode as i64;
+        
+        // Is file (BOOLEAN)
+        let mut is_file_vector = output.flat_vector(7);
+        let is_file_data = is_file_vector.as_mut_slice::<bool>();
+        is_file_data[0] = file_meta.is_file;
+        
+        // Is directory (BOOLEAN)
+        let mut is_dir_vector = output.flat_vector(8);
+        let is_dir_data = is_dir_vector.as_mut_slice::<bool>();
+        is_dir_data[0] = file_meta.is_dir;
+        
+        // Is symlink (BOOLEAN)
+        let mut is_symlink_vector = output.flat_vector(9);
+        let is_symlink_data = is_symlink_vector.as_mut_slice::<bool>();
+        is_symlink_data[0] = file_meta.is_symlink;
         
         // Include hash if available
         let hash_str = file_meta.hash.as_ref().map(|s| s.as_str()).unwrap_or("");
@@ -657,17 +709,17 @@ impl VTab for GlobStatSha256JwalkVTab {
     type BindData = GlobStatSha256JwalkBindData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        // Same column structure as the regular glob_stat_sha256
+        // Column structure with proper types
         bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("size", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("modified_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("accessed_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("created_time", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("size", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        bind.add_result_column("modified_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
+        bind.add_result_column("accessed_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
+        bind.add_result_column("created_time", LogicalTypeHandle::from(LogicalTypeId::Timestamp));
         bind.add_result_column("permissions", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("inode", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("is_file", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("is_dir", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("is_symlink", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("inode", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        bind.add_result_column("is_file", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+        bind.add_result_column("is_dir", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+        bind.add_result_column("is_symlink", LogicalTypeHandle::from(LogicalTypeId::Boolean));
         bind.add_result_column("hash", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
         let pattern = bind.get_parameter(0).to_string();
@@ -700,17 +752,51 @@ impl VTab for GlobStatSha256JwalkVTab {
 
         let file_meta = &bind_data.files[current_idx];
         
-        // Insert data into output vectors (same as existing implementation)
+        // Path (VARCHAR)
         output.flat_vector(0).insert(0, file_meta.path.as_str());
-        output.flat_vector(1).insert(0, file_meta.size.to_string().as_str());
-        output.flat_vector(2).insert(0, file_meta.modified_time.to_string().as_str());
-        output.flat_vector(3).insert(0, file_meta.accessed_time.to_string().as_str());
-        output.flat_vector(4).insert(0, file_meta.created_time.to_string().as_str());
+        
+        // Size (BIGINT)
+        let mut size_vector = output.flat_vector(1);
+        let size_data = size_vector.as_mut_slice::<i64>();
+        size_data[0] = file_meta.size as i64;
+        
+        // Modified time (TIMESTAMP)
+        let mut modified_vector = output.flat_vector(2);
+        let modified_data = modified_vector.as_mut_slice::<i64>();
+        modified_data[0] = file_meta.modified_time;
+        
+        // Accessed time (TIMESTAMP)
+        let mut accessed_vector = output.flat_vector(3);
+        let accessed_data = accessed_vector.as_mut_slice::<i64>();
+        accessed_data[0] = file_meta.accessed_time;
+        
+        // Created time (TIMESTAMP)
+        let mut created_vector = output.flat_vector(4);
+        let created_data = created_vector.as_mut_slice::<i64>();
+        created_data[0] = file_meta.created_time;
+        
+        // Permissions (VARCHAR)
         output.flat_vector(5).insert(0, file_meta.permissions.as_str());
-        output.flat_vector(6).insert(0, file_meta.inode.to_string().as_str());
-        output.flat_vector(7).insert(0, if file_meta.is_file { "true" } else { "false" });
-        output.flat_vector(8).insert(0, if file_meta.is_dir { "true" } else { "false" });
-        output.flat_vector(9).insert(0, if file_meta.is_symlink { "true" } else { "false" });
+        
+        // Inode (BIGINT)
+        let mut inode_vector = output.flat_vector(6);
+        let inode_data = inode_vector.as_mut_slice::<i64>();
+        inode_data[0] = file_meta.inode as i64;
+        
+        // Is file (BOOLEAN)
+        let mut is_file_vector = output.flat_vector(7);
+        let is_file_data = is_file_vector.as_mut_slice::<bool>();
+        is_file_data[0] = file_meta.is_file;
+        
+        // Is directory (BOOLEAN)
+        let mut is_dir_vector = output.flat_vector(8);
+        let is_dir_data = is_dir_vector.as_mut_slice::<bool>();
+        is_dir_data[0] = file_meta.is_dir;
+        
+        // Is symlink (BOOLEAN)
+        let mut is_symlink_vector = output.flat_vector(9);
+        let is_symlink_data = is_symlink_vector.as_mut_slice::<bool>();
+        is_symlink_data[0] = file_meta.is_symlink;
         
         // Include hash if available
         let hash_str = file_meta.hash.as_ref().map(|s| s.as_str()).unwrap_or("");
@@ -1783,7 +1869,310 @@ fn get_inode(metadata: &fs::Metadata) -> u64 {
     }
 }
 
-#[duckdb_entrypoint_c_api()]
+// Age encryption scalar functions
+
+// age_keygen() function - generates a new X25519 key pair
+struct AgeKeygenScalar;
+
+impl VScalar for AgeKeygenScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let struct_vector = output.struct_vector();
+        
+        // Get child vectors for public and private keys
+        let public_key_vector = struct_vector.child(0, input.len());
+        let private_key_vector = struct_vector.child(1, input.len());
+        
+        for i in 0..input.len() {
+            // Generate a new X25519 identity
+            let identity = x25519::Identity::generate();
+            let public_key = identity.to_public();
+            
+            // Convert to string representations
+            let public_key_str = public_key.to_string();
+            let private_key_str = identity.to_string();
+            
+            // Insert into struct fields
+            public_key_vector.insert(i, public_key_str.as_str());
+            private_key_vector.insert(i, private_key_str.expose_secret());
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        // Create STRUCT return type with public_key and private_key fields
+        let struct_type = LogicalTypeHandle::struct_type(&[
+            ("public_key", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ("private_key", LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+        ]);
+        
+        // Use a dummy parameter since DuckDB may not support zero-parameter scalar functions
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::from(LogicalTypeId::Integer)],
+            struct_type,
+        )]
+    }
+}
+
+// age_encrypt() function - single recipient overload
+struct AgeEncryptSingleScalar;
+
+impl VScalar for AgeEncryptSingleScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let data_vector = input.flat_vector(0);
+        let recipient_vector = input.flat_vector(1);
+        
+        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        let recipient_slice = recipient_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        let output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut data_duck_string = data_slice[i];
+            let mut data_str = DuckString::new(&mut data_duck_string);
+            let data_bytes = data_str.as_bytes();
+            
+            let mut recipient_duck_string = recipient_slice[i];
+            let recipient_str = DuckString::new(&mut recipient_duck_string).as_str();
+            
+            match age_encrypt_single(data_bytes, &recipient_str) {
+                Ok(encrypted_data) => {
+                    output_vector.insert(i, encrypted_data.as_slice());
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![
+                LogicalTypeHandle::from(LogicalTypeId::Blob),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ],
+            LogicalTypeHandle::from(LogicalTypeId::Blob),
+        )]
+    }
+}
+
+// age_encrypt_passphrase() function
+struct AgeEncryptPassphraseScalar;
+
+impl VScalar for AgeEncryptPassphraseScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let data_vector = input.flat_vector(0);
+        let passphrase_vector = input.flat_vector(1);
+        
+        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        let passphrase_slice = passphrase_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        let output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut data_duck_string = data_slice[i];
+            let mut data_str = DuckString::new(&mut data_duck_string);
+            let data_bytes = data_str.as_bytes();
+            
+            let mut passphrase_duck_string = passphrase_slice[i];
+            let passphrase_str = DuckString::new(&mut passphrase_duck_string).as_str();
+            
+            match age_encrypt_passphrase(data_bytes, &passphrase_str) {
+                Ok(encrypted_data) => {
+                    output_vector.insert(i, encrypted_data.as_slice());
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![
+                LogicalTypeHandle::from(LogicalTypeId::Blob),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ],
+            LogicalTypeHandle::from(LogicalTypeId::Blob),
+        )]
+    }
+}
+
+// age_decrypt() function - single identity overload
+struct AgeDecryptSingleScalar;
+
+impl VScalar for AgeDecryptSingleScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let data_vector = input.flat_vector(0);
+        let identity_vector = input.flat_vector(1);
+        
+        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        let identity_slice = identity_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        let output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut data_duck_string = data_slice[i];
+            let mut data_str = DuckString::new(&mut data_duck_string);
+            let data_bytes = data_str.as_bytes();
+            
+            let mut identity_duck_string = identity_slice[i];
+            let identity_str = DuckString::new(&mut identity_duck_string).as_str();
+            
+            match age_decrypt_single(data_bytes, &identity_str) {
+                Ok(decrypted_data) => {
+                    output_vector.insert(i, decrypted_data.as_slice());
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![
+                LogicalTypeHandle::from(LogicalTypeId::Blob),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ],
+            LogicalTypeHandle::from(LogicalTypeId::Blob),
+        )]
+    }
+}
+
+// age_decrypt_passphrase() function
+struct AgeDecryptPassphraseScalar;
+
+impl VScalar for AgeDecryptPassphraseScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let data_vector = input.flat_vector(0);
+        let passphrase_vector = input.flat_vector(1);
+        
+        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        let passphrase_slice = passphrase_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        
+        let output_vector = output.flat_vector();
+        
+        for i in 0..input.len() {
+            let mut data_duck_string = data_slice[i];
+            let mut data_str = DuckString::new(&mut data_duck_string);
+            let data_bytes = data_str.as_bytes();
+            
+            let mut passphrase_duck_string = passphrase_slice[i];
+            let passphrase_str = DuckString::new(&mut passphrase_duck_string).as_str();
+            
+            match age_decrypt_passphrase(data_bytes, &passphrase_str) {
+                Ok(decrypted_data) => {
+                    output_vector.insert(i, decrypted_data.as_slice());
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![
+                LogicalTypeHandle::from(LogicalTypeId::Blob),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ],
+            LogicalTypeHandle::from(LogicalTypeId::Blob),
+        )]
+    }
+}
+
+// Age encryption/decryption implementation functions
+
+fn age_encrypt_single(data: &[u8], recipient_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // Parse the recipient public key
+    let recipient: x25519::Recipient = recipient_str.parse()
+        .map_err(|e| format!("Invalid age recipient: {}", e))?;
+    
+    // Encrypt using the simple API
+    let encrypted = age::encrypt(&recipient, data)
+        .map_err(|e| format!("Age encryption failed: {}", e))?;
+    
+    Ok(encrypted)
+}
+
+fn age_encrypt_passphrase(data: &[u8], passphrase: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // Create scrypt recipient with passphrase
+    let recipient = scrypt::Recipient::new(SecretString::from(passphrase.to_string()));
+    
+    // Encrypt using the simple API
+    let encrypted = age::encrypt(&recipient, data)
+        .map_err(|e| format!("Age passphrase encryption failed: {}", e))?;
+    
+    Ok(encrypted)
+}
+
+fn age_decrypt_single(data: &[u8], identity_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // Parse the identity private key
+    let identity: x25519::Identity = identity_str.parse()
+        .map_err(|e| format!("Invalid age identity: {}", e))?;
+    
+    // Decrypt using the simple API
+    let decrypted = age::decrypt(&identity, data)
+        .map_err(|e| format!("Age decryption failed: {}", e))?;
+    
+    Ok(decrypted)
+}
+
+fn age_decrypt_passphrase(data: &[u8], passphrase: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // Create scrypt identity with passphrase
+    let identity = scrypt::Identity::new(SecretString::from(passphrase.to_string()));
+    
+    // Decrypt using the simple API
+    let decrypted = age::decrypt(&identity, data)
+        .map_err(|e| format!("Age passphrase decryption failed: {}", e))?;
+    
+    Ok(decrypted)
+}
+
+#[duckdb_entrypoint_c_api(ext_name = "file_tools")]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<GlobStatVTab>("glob_stat")
         .expect("Failed to register glob_stat table function");
@@ -1821,6 +2210,13 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     
     con.register_scalar_function::<CompressLz4Scalar>("compress_lz4")
         .expect("Failed to register compress_lz4 scalar function");
+    
+    // Age encryption functions - using 'agecrypt' prefix to avoid conflict with DuckDB's built-in 'age' function
+    con.register_scalar_function::<AgeKeygenScalar>("agecrypt_keygen")?;
+    con.register_scalar_function::<AgeEncryptSingleScalar>("agecrypt_encrypt")?;
+    con.register_scalar_function::<AgeEncryptPassphraseScalar>("agecrypt_encrypt_passphrase")?;
+    con.register_scalar_function::<AgeDecryptSingleScalar>("agecrypt_decrypt")?;
+    con.register_scalar_function::<AgeDecryptPassphraseScalar>("agecrypt_decrypt_passphrase")?;
     
     Ok(())
 }

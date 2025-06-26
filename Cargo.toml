@@ -12,6 +12,7 @@ readme = "README.md"
 rust-version = "1.70"
 
 [lib]
+name = "file_tools"
 crate-type = ["cdylib"]
 
 [profile.release]
@@ -38,3 +39,5 @@ rayon = "1.8"
 flate2 = "1.0"
 lz4_flex = "0.11"
 zstd = "0.13"
+age = "0.11"
+secrecy = "0.10"

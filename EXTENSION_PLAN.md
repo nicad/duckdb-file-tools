@@ -266,25 +266,37 @@ Based on the rage library analysis, implement the following DuckDB scalar functi
 
 ##### Core Encryption/Decryption Functions
 
-1. **`age_encrypt(data BLOB, recipient VARCHAR) → BLOB`**
-   - Encrypts BLOB data using X25519 public key encryption
+1. **`age_encrypt(data BLOB, recipients VARCHAR[]) → BLOB`**
+   - Encrypts BLOB data to multiple X25519 public key recipients  
    - `data`: Binary data to encrypt
-   - `recipient`: Age public key in bech32 format (e.g., `age1...`)
+   - `recipients`: Array of age public keys in bech32 format (e.g., `['age1...', 'age1...']`)
+   - Returns: Binary encrypted data in age format (any recipient can decrypt)
+
+2. **`age_encrypt(data BLOB, recipient VARCHAR) → BLOB`** *(overload)*
+   - Encrypts BLOB data to single X25519 public key recipient
+   - `data`: Binary data to encrypt
+   - `recipient`: Single age public key in bech32 format (e.g., `age1...`)
    - Returns: Binary encrypted data in age format
 
-2. **`age_encrypt_passphrase(data BLOB, passphrase VARCHAR) → BLOB`**
+3. **`age_encrypt_passphrase(data BLOB, passphrase VARCHAR) → BLOB`**
    - Encrypts BLOB data using scrypt passphrase-based encryption
    - `data`: Binary data to encrypt  
    - `passphrase`: Password string for encryption
    - Returns: Binary encrypted data in age format
 
-3. **`age_decrypt(encrypted_data BLOB, identity VARCHAR) → BLOB`**
-   - Decrypts age-encrypted data using X25519 private key
+4. **`age_decrypt(encrypted_data BLOB, identities VARCHAR[]) → BLOB`**
+   - Decrypts age-encrypted data trying multiple X25519 private keys
+   - `encrypted_data`: Age-encrypted binary data
+   - `identities`: Array of age private keys in bech32 format (e.g., `['AGE-SECRET-KEY-1...', ...]`)
+   - Returns: Decrypted binary data (first matching identity is used)
+
+5. **`age_decrypt(encrypted_data BLOB, identity VARCHAR) → BLOB`** *(overload)*
+   - Decrypts age-encrypted data using single X25519 private key
    - `encrypted_data`: Age-encrypted binary data
    - `identity`: Age private key in bech32 format (e.g., `AGE-SECRET-KEY-1...`)
    - Returns: Decrypted binary data
 
-4. **`age_decrypt_passphrase(encrypted_data BLOB, passphrase VARCHAR) → BLOB`**
+6. **`age_decrypt_passphrase(encrypted_data BLOB, passphrase VARCHAR) → BLOB`**
    - Decrypts age-encrypted data using passphrase
    - `encrypted_data`: Age-encrypted binary data  
    - `passphrase`: Password string used for encryption
@@ -292,7 +304,7 @@ Based on the rage library analysis, implement the following DuckDB scalar functi
 
 ##### Key Generation Functions
 
-5. **`age_keygen() → STRUCT(public_key VARCHAR, private_key VARCHAR)`**
+7. **`age_keygen() → STRUCT(public_key VARCHAR, private_key VARCHAR)`**
    - Generates a new X25519 key pair
    - Returns: Struct with public and private keys in bech32 format
    - Example: `{public_key: "age1...", private_key: "AGE-SECRET-KEY-1..."}`
