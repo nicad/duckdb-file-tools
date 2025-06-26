@@ -1,7 +1,15 @@
 [package]
-name = "file_tools"
+name = "duckdb-file-tools"
 version = "0.1.0"
 edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "High-performance DuckDB extension for file system operations, metadata extraction, and compression"
+repository = "https://github.com/yourusername/duckdb-file-tools"
+license = "MIT"
+keywords = ["duckdb", "file-system", "compression", "metadata", "hash"]
+categories = ["database", "filesystem", "compression"]
+readme = "README.md"
+rust-version = "1.70"
 
 [lib]
 crate-type = ["cdylib"]

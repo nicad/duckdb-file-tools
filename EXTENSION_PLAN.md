@@ -258,10 +258,117 @@ TODO: what compression method to use ? should it be pluggable ? what is a good r
 4. `permission_errors` optional argument can be 'ignore', 'print', 'fail' (default is 'ignore') - note: scalar functions like read_file_text/read_file_binary should error on permission issues
 5. `symlink` optional argument can be 'follow', 'skip' (default is 'skip') - follow will include loop detection when implemented
 
-#### Phase 5: Age Encryption Integration
-1. File encryption/decryption functions
-2. Integration with rage library
-3. Secure key handling using duckdb secret store
+#### Phase 5: Age Encryption Integration (Current Focus)
+
+**Age Encryption/Decryption API Implementation**
+
+Based on the rage library analysis, implement the following DuckDB scalar functions:
+
+##### Core Encryption/Decryption Functions
+
+1. **`age_encrypt(data BLOB, recipient VARCHAR) → BLOB`**
+   - Encrypts BLOB data using X25519 public key encryption
+   - `data`: Binary data to encrypt
+   - `recipient`: Age public key in bech32 format (e.g., `age1...`)
+   - Returns: Binary encrypted data in age format
+
+2. **`age_encrypt_passphrase(data BLOB, passphrase VARCHAR) → BLOB`**
+   - Encrypts BLOB data using scrypt passphrase-based encryption
+   - `data`: Binary data to encrypt  
+   - `passphrase`: Password string for encryption
+   - Returns: Binary encrypted data in age format
+
+3. **`age_decrypt(encrypted_data BLOB, identity VARCHAR) → BLOB`**
+   - Decrypts age-encrypted data using X25519 private key
+   - `encrypted_data`: Age-encrypted binary data
+   - `identity`: Age private key in bech32 format (e.g., `AGE-SECRET-KEY-1...`)
+   - Returns: Decrypted binary data
+
+4. **`age_decrypt_passphrase(encrypted_data BLOB, passphrase VARCHAR) → BLOB`**
+   - Decrypts age-encrypted data using passphrase
+   - `encrypted_data`: Age-encrypted binary data  
+   - `passphrase`: Password string used for encryption
+   - Returns: Decrypted binary data
+
+##### Key Generation Functions
+
+5. **`age_keygen() → STRUCT(public_key VARCHAR, private_key VARCHAR)`**
+   - Generates a new X25519 key pair
+   - Returns: Struct with public and private keys in bech32 format
+   - Example: `{public_key: "age1...", private_key: "AGE-SECRET-KEY-1..."}`
+
+##### Implementation Plan
+
+**Phase 5.1: Core Dependencies**
+- Add `age = "0.11"` dependency to Cargo.toml
+- Use the existing rage library from `docs/other-extensions/rage/age`
+- Leverage established patterns from compression functions
+
+**Phase 5.2: X25519 Key-Based Encryption**
+- Implement `age_encrypt()` using `age::x25519::Recipient`
+- Implement `age_decrypt()` using `age::x25519::Identity`
+- Use `age::encrypt()` and `age::decrypt()` simple APIs for single recipients
+
+**Phase 5.3: Passphrase-Based Encryption**
+- Implement `age_encrypt_passphrase()` using `age::scrypt::Recipient`
+- Implement `age_decrypt_passphrase()` using `age::scrypt::Identity`
+- Use `age::Encryptor::with_user_passphrase()` for encryption
+
+**Phase 5.4: Key Generation**
+- Implement `age_keygen()` using `age::x25519::Identity::generate()`
+- Return both public and private keys as structured data
+
+**Phase 5.5: Error Handling**
+- Map age encryption errors to appropriate DuckDB errors
+- Handle invalid keys, wrong passphrases, corrupted data gracefully
+- Follow existing error handling patterns from compression functions
+
+##### Usage Examples
+
+```sql
+-- Generate a new key pair
+SELECT age_keygen() AS keys;
+
+-- Encrypt data with public key
+SELECT age_encrypt('sensitive data'::BLOB, 'age1...') AS encrypted;
+
+-- Decrypt with private key  
+SELECT age_decrypt(encrypted_data, 'AGE-SECRET-KEY-1...') AS decrypted;
+
+-- Encrypt with passphrase
+SELECT age_encrypt_passphrase('secret message'::BLOB, 'my-password') AS encrypted;
+
+-- Decrypt with passphrase
+SELECT age_decrypt_passphrase(encrypted_data, 'my-password') AS decrypted;
+
+-- File encryption workflow
+CREATE TABLE encrypted_files AS
+SELECT 
+    path,
+    age_encrypt(read_blob(path), 'age1...') AS encrypted_content
+FROM glob_stat('sensitive_docs/*.txt')
+WHERE is_file = 'true';
+```
+
+##### Technical Implementation Notes
+
+**Rust Implementation Details:**
+- Use `age::encrypt()` and `age::decrypt()` for single-recipient scenarios
+- Handle key parsing using `str::parse()` on recipient/identity strings
+- Stream data through age encryption to handle large BLOBs efficiently
+- Follow existing scalar function patterns from compression implementation
+
+**Security Considerations:**
+- Keys are handled as strings in DuckDB - users responsible for secure storage
+- No persistent key storage in extension (stateless design)
+- Passphrase-based encryption uses scrypt with appropriate work factor
+- Memory is zeroized appropriately by the age library
+
+**Integration Approach:**
+- Mirror compression function structure for consistency
+- Use similar error handling and parameter validation
+- Maintain same performance characteristics as existing functions
+- Support both binary and text-based workflows
 
 ### Performance Considerations
 - **Parallel Processing**: Leverage jwalk's parallel directory traversal

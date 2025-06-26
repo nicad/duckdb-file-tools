@@ -48,3 +48,10 @@ venv.bak/
 
 # Links to other code bases
 /docs/other-extensions/
+
+# Misc development files
+*.sublime-project
+*.sublime-workspace
+explore_*.rs
+test_*.rs
+test_*.sql
