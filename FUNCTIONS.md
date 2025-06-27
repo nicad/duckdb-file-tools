@@ -5,7 +5,8 @@ The File Tools extension provides functions for file system operations, metadata
 ## Latest Changes
 
 **v0.1.0 - Advanced Glob Options & Multi-Algorithm Compression**
-- ✅ **Advanced glob options**: Added `follow_symlinks`, `exclude` patterns, and `ignore_case` parameters to `glob_stat()`
+- ✅ **Universal named parameters**: All `glob_stat*` functions now support `ignore_case`, `follow_symlinks`, and `exclude` parameters
+- ✅ **Advanced glob options**: Added optional named parameters to `glob_stat()`, `glob_stat_sha256_parallel()`, and `glob_stat_sha256_jwalk()`
 - ✅ **Exclude patterns**: Support for glob-style exclude patterns using array syntax (e.g., `exclude := ['*.tmp', '*.bak', 'node_modules/']`)
 - ✅ **Symlink control**: Configure whether to follow symbolic links with `follow_symlinks` parameter
 - ✅ **Case-insensitive glob matching**: Added `ignore_case` parameter for case-insensitive pattern matching
@@ -71,25 +72,7 @@ WHERE CAST(size AS BIGINT) > 1000000;
 -- Basic file listing with metadata
 SELECT path, is_file, is_dir 
 FROM glob_stat('data/**/*');
-```
 
-### `glob_stat_legacy(pattern)`
-
-A simpler version of `glob_stat()` without optional parameters, useful for basic file listing and testing.
-
-**Syntax**
-```sql
-SELECT * FROM glob_stat_legacy(pattern)
-```
-
-**Parameters**
-- `pattern` (`VARCHAR`): A glob pattern to match files
-
-**Returns**
-Same columns as `glob_stat()` with default behavior (case-sensitive, follows symlinks, no excludes).
-
-**Examples**
-```sql
 -- Case-insensitive matching (.txt, .TXT, .Txt, etc.)
 SELECT path FROM glob_stat('**/*.txt', ignore_case := true);
 
@@ -119,9 +102,30 @@ FROM glob_stat('**/*')
 UNION ALL
 SELECT 'filtered files' as category, count(*) as file_count  
 FROM glob_stat('**/*', exclude := ['*.tmp', '.git/', 'node_modules/']);
+```
 
+### `glob_stat_legacy(pattern)`
+
+A simpler version of `glob_stat()` without optional parameters, useful for basic file listing and testing.
+
+**Syntax**
+```sql
+SELECT * FROM glob_stat_legacy(pattern)
+```
+
+**Parameters**
+- `pattern` (`VARCHAR`): A glob pattern to match files
+
+**Returns**
+Same columns as `glob_stat()` with default behavior (case-sensitive, follows symlinks, no excludes).
+
+**Examples**
+```sql
 -- Simple glob_stat_legacy for testing without options
 SELECT path, size FROM glob_stat_legacy('*.csv');
+
+-- Legacy function without advanced features
+SELECT COUNT(*) FROM glob_stat_legacy('**/*.txt');
 ```
 
 **Exclude Pattern Features**
@@ -140,17 +144,25 @@ SELECT path, size FROM glob_stat_legacy('*.csv');
 - Case-insensitive matching may be slower on large datasets
 
 
-### `glob_stat_sha256_parallel(pattern)`
+### `glob_stat_sha256_parallel(pattern, ignore_case, follow_symlinks, exclude)`
 
-**High-performance parallel version** of file scanning with SHA256 hash computation. Uses multi-threading to dramatically improve performance on large directories.
+**High-performance parallel version** of file scanning with SHA256 hash computation. Uses multi-threading to dramatically improve performance on large directories. Supports the same optional named parameters as `glob_stat()`.
 
 **Syntax**
 ```sql
-SELECT * FROM glob_stat_sha256_parallel(pattern)
+SELECT * FROM glob_stat_sha256_parallel(
+    pattern,
+    ignore_case := false,
+    follow_symlinks := true,
+    exclude := []
+)
 ```
 
 **Parameters**
 - `pattern` (`VARCHAR`): A glob pattern to match files
+- `ignore_case` (`BOOLEAN`, optional): Whether to perform case-insensitive pattern matching (default: `false`)
+- `follow_symlinks` (`BOOLEAN`, optional): Whether to follow symbolic links (default: `true`) 
+- `exclude` (`LIST(VARCHAR)`, optional): Array of glob patterns to exclude from results (default: `[]`)
 
 **Returns**
 Returns the following columns:
@@ -179,11 +191,19 @@ Returns the following columns:
 - **Batch processing**: Creating file manifests, backup verification, etc.
 - **Multi-core systems**: Best performance on systems with multiple CPU cores
 
-**Example**
+**Examples**
 ```sql
 -- Fast hash computation for large directories
 SELECT path, hash 
 FROM glob_stat_sha256_parallel('large_dataset/**/*');
+
+-- Case-insensitive hash computation with excludes
+SELECT path, hash
+FROM glob_stat_sha256_parallel(
+    '**/*.{TXT,CSV}',
+    ignore_case := true,
+    exclude := ['*.tmp', '.git/', 'node_modules/']
+);
 
 -- Performance comparison with different implementations
 SELECT COUNT(*) as file_count, 'parallel' as method
@@ -203,17 +223,25 @@ FROM glob_stat_sha256_parallel('/backup/data/**/*')
 WHERE is_file = 'true';
 ```
 
-### `glob_stat_sha256_jwalk(pattern)`
+### `glob_stat_sha256_jwalk(pattern, ignore_case, follow_symlinks, exclude)`
 
-**Alternative parallel implementation** using the `jwalk` crate for directory traversal. Provides identical results to `glob_stat_sha256_parallel` but with different internal implementation for comparison and testing.
+**Alternative parallel implementation** using the `jwalk` crate for directory traversal. Provides identical results to `glob_stat_sha256_parallel` but with different internal implementation for comparison and testing. Supports the same optional named parameters as other glob_stat functions.
 
 **Syntax**
 ```sql
-SELECT * FROM glob_stat_sha256_jwalk(pattern)
+SELECT * FROM glob_stat_sha256_jwalk(
+    pattern,
+    ignore_case := false,
+    follow_symlinks := true,
+    exclude := []
+)
 ```
 
 **Parameters**
 - `pattern` (`VARCHAR`): A glob pattern to match files
+- `ignore_case` (`BOOLEAN`, optional): Whether to perform case-insensitive pattern matching (default: `false`)
+- `follow_symlinks` (`BOOLEAN`, optional): Whether to follow symbolic links (default: `true`) 
+- `exclude` (`LIST(VARCHAR)`, optional): Array of glob patterns to exclude from results (default: `[]`)
 
 **Returns**
 Same columns as the parallel implementation:
@@ -240,8 +268,21 @@ Same columns as the parallel implementation:
 - **Alternative implementation**: When glob-based traversal has issues
 - **Development**: For testing different directory walking approaches
 
-**Example**
+**Examples**
 ```sql
+-- Basic usage with pattern
+SELECT path, hash
+FROM glob_stat_sha256_jwalk('data/**/*.txt');
+
+-- Advanced usage with named parameters
+SELECT path, hash, size
+FROM glob_stat_sha256_jwalk(
+    '**/*.{JPG,PNG}',
+    ignore_case := true,
+    follow_symlinks := false,
+    exclude := ['thumbnails/', '*.tmp']
+);
+
 -- Compare implementations on same directory
 SELECT 'jwalk' as method, COUNT(*) as file_count, AVG(CAST(size AS BIGINT)) as avg_size
 FROM glob_stat_sha256_jwalk('data/**/*')

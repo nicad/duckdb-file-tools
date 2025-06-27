@@ -1,3 +1,6 @@
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::len_zero)]
+
 extern crate duckdb;
 extern crate duckdb_loadable_macros;
 extern crate libduckdb_sys;
@@ -428,6 +431,7 @@ impl VTab for GlobStatSingleVTab {
 
 // Scalar-like functions implemented as table functions that return single rows
 
+#[allow(dead_code)]
 fn collect_files_with_duckdb_glob(pattern: &str, ignore_case: bool) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let mut results = Vec::new();
     let mut _error_count = 0;
@@ -844,6 +848,14 @@ impl VTab for GlobStatSha256ParallelVTab {
     type InitData = GlobStatSha256ParallelInitData;
     type BindData = GlobStatSha256ParallelBindData;
 
+    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
+        Some(vec![
+            ("ignore_case".to_string(), LogicalTypeHandle::from(LogicalTypeId::Boolean)),
+            ("follow_symlinks".to_string(), LogicalTypeHandle::from(LogicalTypeId::Boolean)),
+            ("exclude".to_string(), LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar))),
+        ])
+    }
+
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         // Column structure with proper types
         bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
@@ -874,9 +886,14 @@ impl VTab for GlobStatSha256ParallelVTab {
         bind.add_result_column("hash", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
         let pattern = bind.get_parameter(0).to_string();
+        
+        // Get optional named parameters using helper functions
+        let ignore_case = get_ignore_case_parameter(bind)?;
+        let follow_symlinks = get_follow_symlinks_parameter(bind)?;
+        let exclude_patterns = get_exclude_patterns(bind)?;
 
-        // Use parallel file collection with hash computation
-        let files = collect_files_with_parallel_hashing(&pattern)?;
+        // Use parallel file collection with hash computation and optional parameters
+        let files = collect_files_with_parallel_hashing(&pattern, ignore_case, follow_symlinks, &exclude_patterns)?;
 
         Ok(GlobStatSha256ParallelBindData { pattern, files })
     }
@@ -952,7 +969,7 @@ impl VTab for GlobStatSha256ParallelVTab {
         is_symlink_data[0] = file_meta.is_symlink;
 
         // Include hash if available
-        let hash_str = file_meta.hash.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let hash_str = file_meta.hash.as_deref().unwrap_or("");
         output.flat_vector(10).insert(0, hash_str);
 
         output.set_len(1);
@@ -968,7 +985,12 @@ impl VTab for GlobStatSha256ParallelVTab {
     }
 }
 
-fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
+fn collect_files_with_parallel_hashing(
+    pattern: &str,
+    ignore_case: bool,
+    follow_symlinks: bool,
+    exclude_patterns: &[String],
+) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let total_start = Instant::now();
     debug_println!(
         "[PERF] Starting parallel collection for pattern: {}",
@@ -980,14 +1002,34 @@ fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata
     let rust_pattern = normalize_glob_pattern(pattern);
     debug_println!("[PERF] Normalized pattern: {} -> {}", pattern, rust_pattern);
 
-    let file_paths: Vec<_> = glob(&rust_pattern)?
-        .filter_map(|entry| entry.ok())
-        .collect();
+    // Create match options for case sensitivity
+    let match_options = MatchOptions {
+        case_sensitive: !ignore_case,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+    
+    let file_paths: Vec<_> = if ignore_case {
+        glob_with(&rust_pattern, match_options)?
+    } else {
+        glob(&rust_pattern)?
+    }
+    .filter_map(|entry| entry.ok())
+    .filter(|path| {
+        // Apply exclude patterns
+        let path_str = path.to_string_lossy();
+        !exclude_patterns.iter().any(|pattern| {
+            glob::Pattern::new(pattern)
+                .map(|p| p.matches(&path_str))
+                .unwrap_or(false)
+        })
+    })
+    .collect();
 
-    let glob_duration = glob_start.elapsed();
+    let _glob_duration = glob_start.elapsed();
     debug_println!(
         "[PERF] Glob expansion took: {:?}, found {} paths",
-        glob_duration,
+        _glob_duration,
         file_paths.len()
     );
 
@@ -1000,7 +1042,7 @@ fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata
     let metadata_count_start = Instant::now();
     let (file_count, dir_count, error_count) = file_paths
         .par_iter()
-        .map(|path| match fs::metadata(path) {
+        .map(|path| match if follow_symlinks { fs::metadata(path) } else { fs::symlink_metadata(path) } {
             Ok(meta) => {
                 if meta.is_file() {
                     (1, 0, 0)
@@ -1014,10 +1056,10 @@ fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata
         })
         .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
 
-    let metadata_count_duration = metadata_count_start.elapsed();
+    let _metadata_count_duration = metadata_count_start.elapsed();
     debug_println!(
         "[PERF] Quick metadata scan took: {:?}",
-        metadata_count_duration
+        _metadata_count_duration
     );
     debug_println!(
         "[PERF] Found {} files, {} directories, {} errors",
@@ -1039,24 +1081,26 @@ fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata
             let item_start = Instant::now();
 
             // Get metadata first - use robust error handling like the sequential version
-            let metadata = match fs::metadata(&path) {
+            let metadata = match if follow_symlinks { fs::metadata(&path) } else { fs::symlink_metadata(&path) } {
                 Ok(meta) => meta,
                 Err(_) => return None, // Skip files we can't access
             };
+            
+            // Skip symlinks if follow_symlinks is false and this is a symlink
+            if !follow_symlinks && metadata.file_type().is_symlink() {
+                return None;
+            }
 
-            let metadata_duration = item_start.elapsed();
+            let _metadata_duration = item_start.elapsed();
 
             // Compute hash in parallel for files only
             let hash_start = Instant::now();
             let hash = if metadata.is_file() {
-                match compute_file_hash_streaming_instrumented(&path) {
-                    Ok(h) => Some(h),
-                    Err(_) => None,
-                }
+                compute_file_hash_streaming_instrumented(&path).ok()
             } else {
                 None
             };
-            let hash_duration = hash_start.elapsed();
+            let _hash_duration = hash_start.elapsed();
 
             let total_item_duration = item_start.elapsed();
 
@@ -1066,8 +1110,8 @@ fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata
                     "[PERF] Slow item: {} took {:?} (metadata: {:?}, hash: {:?})",
                     path.display(),
                     total_item_duration,
-                    metadata_duration,
-                    hash_duration
+                    _metadata_duration,
+                    _hash_duration
                 );
             }
 
@@ -1095,11 +1139,11 @@ fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata
         })
         .collect();
 
-    let parallel_duration = parallel_start.elapsed();
-    let total_duration = total_start.elapsed();
+    let _parallel_duration = parallel_start.elapsed();
+    let _total_duration = total_start.elapsed();
 
-    debug_println!("[PERF] Parallel processing took: {:?}", parallel_duration);
-    debug_println!("[PERF] Total operation took: {:?}", total_duration);
+    debug_println!("[PERF] Parallel processing took: {:?}", _parallel_duration);
+    debug_println!("[PERF] Total operation took: {:?}", _total_duration);
     debug_println!(
         "[PERF] Processed {} items, returned {} results",
         file_count + dir_count,
@@ -1108,9 +1152,9 @@ fn collect_files_with_parallel_hashing(pattern: &str) -> Result<Vec<FileMetadata
     debug_println!(
         "[PERF] Average time per item: {:?}",
         if files.len() > 0 {
-            parallel_duration / files.len() as u32
+            _parallel_duration / files.len() as u32
         } else {
-            parallel_duration
+            _parallel_duration
         }
     );
 
@@ -1134,6 +1178,14 @@ struct GlobStatSha256JwalkVTab;
 impl VTab for GlobStatSha256JwalkVTab {
     type InitData = GlobStatSha256JwalkInitData;
     type BindData = GlobStatSha256JwalkBindData;
+
+    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
+        Some(vec![
+            ("ignore_case".to_string(), LogicalTypeHandle::from(LogicalTypeId::Boolean)),
+            ("follow_symlinks".to_string(), LogicalTypeHandle::from(LogicalTypeId::Boolean)),
+            ("exclude".to_string(), LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar))),
+        ])
+    }
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         // Column structure with proper types
@@ -1165,9 +1217,14 @@ impl VTab for GlobStatSha256JwalkVTab {
         bind.add_result_column("hash", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
         let pattern = bind.get_parameter(0).to_string();
+        
+        // Get optional named parameters using helper functions
+        let ignore_case = get_ignore_case_parameter(bind)?;
+        let follow_symlinks = get_follow_symlinks_parameter(bind)?;
+        let exclude_patterns = get_exclude_patterns(bind)?;
 
-        // Use jwalk for parallel directory walking
-        let files = collect_files_with_jwalk_parallel(&pattern)?;
+        // Use jwalk for parallel directory walking with optional parameters
+        let files = collect_files_with_jwalk_parallel(&pattern, ignore_case, follow_symlinks, &exclude_patterns)?;
 
         Ok(GlobStatSha256JwalkBindData { pattern, files })
     }
@@ -1243,7 +1300,7 @@ impl VTab for GlobStatSha256JwalkVTab {
         is_symlink_data[0] = file_meta.is_symlink;
 
         // Include hash if available
-        let hash_str = file_meta.hash.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let hash_str = file_meta.hash.as_deref().unwrap_or("");
         output.flat_vector(10).insert(0, hash_str);
 
         output.set_len(1);
@@ -1259,7 +1316,12 @@ impl VTab for GlobStatSha256JwalkVTab {
     }
 }
 
-fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
+fn collect_files_with_jwalk_parallel(
+    pattern: &str,
+    ignore_case: bool,
+    follow_symlinks: bool,
+    exclude_patterns: &[String],
+) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let total_start = Instant::now();
     debug_println!("[JWALK] Starting jwalk collection for pattern: {}", pattern);
 
@@ -1283,7 +1345,11 @@ fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>,
     let walk_start = Instant::now();
 
     // Collect all paths first, then apply the exact same filtering as the glob-based version
-    let all_paths: Vec<_> = WalkDir::new(base_dir)
+    let mut walk_dir = WalkDir::new(base_dir);
+    if !follow_symlinks {
+        walk_dir = walk_dir.follow_links(false);
+    }
+    let all_paths: Vec<_> = walk_dir
         .into_iter()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path().to_path_buf())
@@ -1295,12 +1361,47 @@ fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>,
     );
 
     // Apply the same glob pattern matching as the parallel version
+    let match_options = MatchOptions {
+        case_sensitive: !ignore_case,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
     let glob_pattern = glob::Pattern::new(&rust_pattern)?;
+    // Note: glob crate doesn't support case-insensitive patterns, so we'll handle case manually if needed
+    
     let matching_paths: Vec<_> = all_paths
         .into_iter()
         .filter(|path| {
             if let Some(path_str) = path.to_str() {
-                glob_pattern.matches(path_str)
+                // First check if it matches the main pattern
+                let matches_pattern = if ignore_case {
+                    let pattern_lower = rust_pattern.to_lowercase();
+                    let path_lower = path_str.to_lowercase();
+                    glob::Pattern::new(&pattern_lower)
+                        .map(|p| p.matches(&path_lower))
+                        .unwrap_or(false)
+                } else {
+                    glob_pattern.matches(path_str)
+                };
+                
+                if !matches_pattern {
+                    return false;
+                }
+                
+                // Then check if it matches any exclude patterns
+                !exclude_patterns.iter().any(|pattern| {
+                    if ignore_case {
+                        let pattern_lower = pattern.to_lowercase();
+                        let path_lower = path_str.to_lowercase();
+                        glob::Pattern::new(&pattern_lower)
+                            .map(|p| p.matches(&path_lower))
+                            .unwrap_or(false)
+                    } else {
+                        glob::Pattern::new(pattern)
+                            .map(|p| p.matches(path_str))
+                            .unwrap_or(false)
+                    }
+                })
             } else {
                 false
             }
@@ -1309,9 +1410,30 @@ fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>,
 
     // Debug: Compare with what the glob-based version would find
     debug_println!("[JWALK] Comparing with glob crate results...");
-    let glob_results: Vec<_> = glob(&rust_pattern)?
-        .filter_map(|entry| entry.ok())
-        .collect();
+    let glob_results: Vec<_> = if ignore_case {
+        glob_with(&rust_pattern, match_options)?
+    } else {
+        glob(&rust_pattern)?
+    }
+    .filter_map(|entry| entry.ok())
+    .filter(|path| {
+        // Apply exclude patterns to glob results for fair comparison
+        let path_str = path.to_string_lossy();
+        !exclude_patterns.iter().any(|pattern| {
+            if ignore_case {
+                let pattern_lower = pattern.to_lowercase();
+                let path_lower = path_str.to_lowercase();
+                glob::Pattern::new(&pattern_lower)
+                    .map(|p| p.matches(&path_lower))
+                    .unwrap_or(false)
+            } else {
+                glob::Pattern::new(pattern)
+                    .map(|p| p.matches(&path_str))
+                    .unwrap_or(false)
+            }
+        })
+    })
+    .collect();
 
     debug_println!("[JWALK] jwalk found: {} paths", matching_paths.len());
     debug_println!("[JWALK] glob crate found: {} paths", glob_results.len());
@@ -1349,10 +1471,10 @@ fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>,
     // Use the same results as glob for accuracy
     let matching_paths = glob_results;
 
-    let walk_duration = walk_start.elapsed();
+    let _walk_duration = walk_start.elapsed();
     debug_println!(
         "[JWALK] Parallel directory walk took: {:?}, found {} matching paths",
-        walk_duration,
+        _walk_duration,
         matching_paths.len()
     );
 
@@ -1365,7 +1487,7 @@ fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>,
     let count_start = Instant::now();
     let (file_count, dir_count, error_count) = matching_paths
         .par_iter()
-        .map(|path| match fs::metadata(path) {
+        .map(|path| match if follow_symlinks { fs::metadata(path) } else { fs::symlink_metadata(path) } {
             Ok(meta) => {
                 if meta.is_file() {
                     (1, 0, 0)
@@ -1379,8 +1501,8 @@ fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>,
         })
         .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
 
-    let count_duration = count_start.elapsed();
-    debug_println!("[JWALK] Metadata count took: {:?}", count_duration);
+    let _count_duration = count_start.elapsed();
+    debug_println!("[JWALK] Metadata count took: {:?}", _count_duration);
     debug_println!(
         "[JWALK] Found {} files, {} directories, {} errors",
         file_count,
@@ -1401,24 +1523,26 @@ fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>,
             let item_start = Instant::now();
 
             // Get metadata first
-            let metadata = match fs::metadata(&path) {
+            let metadata = match if follow_symlinks { fs::metadata(&path) } else { fs::symlink_metadata(&path) } {
                 Ok(meta) => meta,
                 Err(_) => return None,
             };
+            
+            // Skip symlinks if follow_symlinks is false and this is a symlink
+            if !follow_symlinks && metadata.file_type().is_symlink() {
+                return None;
+            }
 
-            let metadata_duration = item_start.elapsed();
+            let _metadata_duration = item_start.elapsed();
 
             // Compute hash in parallel for files only
             let hash_start = Instant::now();
             let hash = if metadata.is_file() {
-                match compute_file_hash_streaming_instrumented(&path) {
-                    Ok(h) => Some(h),
-                    Err(_) => None,
-                }
+                compute_file_hash_streaming_instrumented(&path).ok()
             } else {
                 None
             };
-            let hash_duration = hash_start.elapsed();
+            let _hash_duration = hash_start.elapsed();
 
             let total_item_duration = item_start.elapsed();
 
@@ -1428,8 +1552,8 @@ fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>,
                     "[JWALK] Slow item: {} took {:?} (metadata: {:?}, hash: {:?})",
                     path.display(),
                     total_item_duration,
-                    metadata_duration,
-                    hash_duration
+                    _metadata_duration,
+                    _hash_duration
                 );
             }
 
@@ -1457,11 +1581,11 @@ fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>,
         })
         .collect();
 
-    let parallel_duration = parallel_start.elapsed();
-    let total_duration = total_start.elapsed();
+    let _parallel_duration = parallel_start.elapsed();
+    let _total_duration = total_start.elapsed();
 
-    debug_println!("[JWALK] Parallel processing took: {:?}", parallel_duration);
-    debug_println!("[JWALK] Total operation took: {:?}", total_duration);
+    debug_println!("[JWALK] Parallel processing took: {:?}", _parallel_duration);
+    debug_println!("[JWALK] Total operation took: {:?}", _total_duration);
     debug_println!(
         "[JWALK] Processed {} items, returned {} results",
         file_count + dir_count,
@@ -1470,9 +1594,9 @@ fn collect_files_with_jwalk_parallel(pattern: &str) -> Result<Vec<FileMetadata>,
     debug_println!(
         "[JWALK] Average time per item: {:?}",
         if files.len() > 0 {
-            parallel_duration / files.len() as u32
+            _parallel_duration / files.len() as u32
         } else {
-            parallel_duration
+            _parallel_duration
         }
     );
 
@@ -2289,12 +2413,12 @@ fn compute_file_hash_streaming_instrumented(path: &Path) -> Result<String, Box<d
 
     let result = hasher.finalize();
     let total_duration = start_time.elapsed();
-    let hash_duration = hash_start.elapsed();
+    let _hash_duration = hash_start.elapsed();
 
     // Log detailed stats for larger files (> 1MB) or slow operations (> 500ms)
     if file_size > 1024 * 1024 || total_duration.as_millis() > 500 {
-        let throughput = if hash_duration.as_secs() > 0 {
-            (total_bytes_read as f64) / (1024.0 * 1024.0 * hash_duration.as_secs_f64())
+        let throughput = if _hash_duration.as_secs() > 0 {
+            (total_bytes_read as f64) / (1024.0 * 1024.0 * _hash_duration.as_secs_f64())
         } else {
             0.0
         };
@@ -2305,7 +2429,7 @@ fn compute_file_hash_streaming_instrumented(path: &Path) -> Result<String, Box<d
             file_size,
             total_duration,
             open_duration,
-            hash_duration,
+            _hash_duration,
             read_count,
             throughput
         );
@@ -3068,6 +3192,12 @@ fn age_decrypt_passphrase(
 // For now, use age_keygen_secret() to generate the CREATE SECRET SQL and execute manually.
 
 #[duckdb_entrypoint_c_api(ext_name = "file_tools")]
+/// # Safety
+/// 
+/// This function is called by the DuckDB extension loading mechanism.
+/// It must only be called from DuckDB's extension loader with a valid Connection.
+/// The caller is responsible for ensuring the Connection remains valid for the
+/// duration of the function call.
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     // Register legacy single-parameter version
     con.register_table_function::<GlobStatSingleVTab>("glob_stat_legacy")
