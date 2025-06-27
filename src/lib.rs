@@ -10,15 +10,14 @@ use duckdb::{
 };
 use duckdb_loadable_macros::duckdb_entrypoint_c_api;
 use libduckdb_sys as ffi;
-use libduckdb_sys::{duckdb_string_t, duckdb_list_entry};
+use libduckdb_sys::duckdb_string_t;
 use duckdb::types::DuckString;
 use std::{
     error::Error,
-    ffi::CString,
     fs,
     io::Read,
     path::Path,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, Instant},
     env,
 };
@@ -182,7 +181,7 @@ impl VTab for GlobStatVTab {
 
 fn collect_files_with_duckdb_glob(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let mut results = Vec::new();
-    let mut error_count = 0;
+    let mut _error_count = 0;
     
     // Convert DuckDB glob patterns to Rust glob crate patterns
     let rust_pattern = normalize_glob_pattern(pattern);
@@ -220,13 +219,13 @@ fn collect_files_with_duckdb_glob(pattern: &str) -> Result<Vec<FileMetadata>, Bo
                     }
                     Err(_) => {
                         // Skip files we can't access (permission errors, etc.)
-                        error_count += 1;
+                        _error_count += 1;
                     }
                 }
             }
             Err(_) => {
                 // Skip entries that couldn't be processed
-                error_count += 1;
+                _error_count += 1;
             }
         }
     }
@@ -1261,6 +1260,7 @@ enum CompressionAlgorithm {
 }
 
 impl CompressionAlgorithm {
+    #[allow(dead_code)]
     fn from_str(s: &str) -> Result<Self, Box<dyn std::error::Error>> {
         match s.to_lowercase().as_str() {
             "gzip" | "gz" => Ok(CompressionAlgorithm::Gzip),
@@ -1703,6 +1703,7 @@ fn get_file_metadata_struct(filename: &str) -> Result<Option<FileMetadata>, Box<
     }
 }
 
+#[allow(dead_code)]
 fn get_file_metadata_json(filename: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let path = Path::new(filename);
     
@@ -1831,6 +1832,7 @@ fn compute_file_hash_streaming(path: &Path) -> Result<String, Box<dyn Error>> {
 }
 
 // Legacy function kept for compatibility (not used anymore)
+#[allow(dead_code)]
 fn compute_file_hash(path: &Path) -> Result<String, Box<dyn Error>> {
     let contents = fs::read(path)?;
     let mut hasher = Sha256::new();
@@ -1978,11 +1980,10 @@ impl VScalar for AgeKeygenSecretScalar {
 
 // Helper function to extract string list from DuckDB ListVector
 // This will help us discover the correct API through compiler errors
-fn extract_string_list(list_vector: &duckdb::core::ListVector, row_idx: usize) -> Option<Vec<String>> {
+fn extract_string_list(list_vector: &duckdb::core::ListVector, _row_idx: usize) -> Option<Vec<String>> {
     // Try to access the list entries using unsafe FFI
     // DuckDB stores list entries as an array of duckdb_list_entry structs
     
-    use std::slice;
     
     // This is experimental - try to access the internal list entries
     // We need to get the list entry data somehow
@@ -2395,6 +2396,7 @@ impl VScalar for AgeDecryptPassphraseScalar {
 
 // Age encryption/decryption implementation functions
 
+#[allow(dead_code)]
 fn age_encrypt_single(data: &[u8], recipient_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     // Parse the recipient public key
     let recipient: x25519::Recipient = recipient_str.parse()
@@ -2449,6 +2451,7 @@ fn age_encrypt_passphrase(data: &[u8], passphrase: &str) -> Result<Vec<u8>, Box<
     Ok(encrypted)
 }
 
+#[allow(dead_code)]
 fn age_decrypt_single(data: &[u8], identity_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     // Parse the identity private key
     let identity: x25519::Identity = identity_str.parse()
