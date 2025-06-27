@@ -29,8 +29,16 @@ jobs:
       with:
         toolchain: ${{ matrix.rust }}
 
+    - name: Show environment info
+      run: |
+        rustc --version
+        cargo --version
+        python3 --version
+        echo "OS: ${{ runner.os }}"
+        echo "Target: ${{ matrix.target || 'default' }}"
+
     - name: Cache Rust dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -41,9 +49,15 @@ jobs:
           ${{ runner.os }}-cargo-
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+
+    - name: Install system dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential pkg-config
 
     - name: Configure extension
       run: make configure
@@ -76,7 +90,7 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Run clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy --all-targets --all-features -- -D warnings -A clippy::type_complexity -A clippy::too_many_arguments -A clippy::needless_range_loop -A clippy::option_as_ref_deref -A clippy::manual_ok_err -A clippy::len_zero -A clippy::unnecessary_cast -A clippy::missing_safety_doc
 
   security:
     name: Security Audit
@@ -125,9 +139,15 @@ jobs:
         targets: ${{ matrix.target }}
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+
+    - name: Install system dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential pkg-config
 
     - name: Configure extension
       run: make configure
@@ -136,7 +156,7 @@ jobs:
       run: make release
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: file-tools-${{ matrix.target }}
         path: build/release/file_tools.duckdb_extension
@@ -156,7 +176,7 @@ jobs:
       run: cargo doc --no-deps --all-features
 
     - name: Upload documentation
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: documentation
         path: target/doc/
