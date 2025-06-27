@@ -13,7 +13,7 @@ use duckdb::{
 };
 use duckdb_loadable_macros::duckdb_entrypoint_c_api;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use glob::glob;
+use glob::{glob, glob_with, MatchOptions};
 use jwalk::WalkDir;
 use libduckdb_sys as ffi;
 use libduckdb_sys::duckdb_string_t;
@@ -62,6 +62,9 @@ struct FileMetadata {
 #[repr(C)]
 struct GlobStatBindData {
     pattern: String,
+    ignore_case: bool,
+    follow_symlinks: bool,
+    exclude_patterns: Vec<String>,
     files: Vec<FileMetadata>,
 }
 
@@ -71,6 +74,9 @@ struct GlobStatInitData {
 }
 
 struct GlobStatVTab;
+
+// Single-parameter version of glob_stat for optional parameter support
+struct GlobStatSingleVTab;
 
 impl VTab for GlobStatVTab {
     type InitData = GlobStatInitData;
@@ -104,11 +110,22 @@ impl VTab for GlobStatVTab {
         );
 
         let pattern = bind.get_parameter(0).to_string();
+        
+        // Get all parameters (named or with defaults)
+        let ignore_case = get_ignore_case_parameter(bind).unwrap_or(false);
+        let follow_symlinks = get_follow_symlinks_parameter(bind).unwrap_or(true);
+        let exclude_patterns = get_exclude_patterns(bind).unwrap_or_default();
 
-        // Use DuckDB's built-in glob function for pattern matching (no hash computation)
-        let files = collect_files_with_duckdb_glob(&pattern)?;
+        // Use enhanced glob function with new parameters
+        let files = collect_files_with_options(&pattern, ignore_case, follow_symlinks, &exclude_patterns)?;
 
-        Ok(GlobStatBindData { pattern, files })
+        Ok(GlobStatBindData { 
+            pattern, 
+            ignore_case, 
+            follow_symlinks,
+            exclude_patterns,
+            files 
+        })
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
@@ -191,22 +208,242 @@ impl VTab for GlobStatVTab {
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // pattern
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // pattern (required)
+        ])
+    }
+
+    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
+        Some(vec![
+            (
+                "ignore_case".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Boolean),
+            ),
+            (
+                "follow_symlinks".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Boolean),
+            ),
+            (
+                "exclude".to_string(),
+                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ),
+        ])
+    }
+}
+
+// Helper function to get ignore_case parameter from either named or positional
+fn get_ignore_case_parameter(bind: &BindInfo) -> Result<bool, Box<dyn std::error::Error>> {
+    // First try named parameter using the proper BindInfo API
+    if let Some(named_value) = bind.get_named_parameter("ignore_case") {
+        let ignore_case_str = named_value.to_string();
+        return Ok(ignore_case_str.to_lowercase() == "true");
+    }
+    
+    // Fallback: check for positional parameter
+    if bind.get_parameter_count() > 1 {
+        let ignore_case_param = bind.get_parameter(1).to_string();
+        Ok(ignore_case_param.to_lowercase() == "true")
+    } else {
+        // Default value
+        Ok(false)
+    }
+}
+
+// Helper function to get follow_symlinks parameter
+fn get_follow_symlinks_parameter(bind: &BindInfo) -> Result<bool, Box<dyn std::error::Error>> {
+    // Try named parameter
+    if let Some(named_value) = bind.get_named_parameter("follow_symlinks") {
+        let follow_symlinks_str = named_value.to_string();
+        return Ok(follow_symlinks_str.to_lowercase() == "true");
+    }
+    
+    // Default value: true (current behavior is to follow symlinks)
+    Ok(true)
+}
+
+// Helper function to get exclude patterns
+fn get_exclude_patterns(bind: &BindInfo) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    // Try named parameter
+    if let Some(named_value) = bind.get_named_parameter("exclude") {
+        // Handle list of strings
+        let exclude_str = named_value.to_string();
+        
+        // Parse the list format from DuckDB (likely something like "[pattern1, pattern2, ...]")
+        // For now, let's handle both single strings and basic list formats
+        if exclude_str.starts_with('[') && exclude_str.ends_with(']') {
+            // Parse as list
+            let inner = &exclude_str[1..exclude_str.len()-1];
+            let patterns: Vec<String> = inner
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return Ok(patterns);
+        } else if !exclude_str.is_empty() && exclude_str != "NULL" {
+            // Handle single pattern
+            return Ok(vec![exclude_str]);
+        }
+    }
+    
+    // Default: no exclusions
+    Ok(Vec::new())
+}
+
+
+// Single-parameter implementation of glob_stat (ignore_case defaults to false)
+impl VTab for GlobStatSingleVTab {
+    type InitData = GlobStatInitData;
+    type BindData = GlobStatBindData;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        // Add result columns (same as the two-parameter version)
+        bind.add_result_column("path", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("size", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        bind.add_result_column(
+            "modified_time",
+            LogicalTypeHandle::from(LogicalTypeId::Timestamp),
+        );
+        bind.add_result_column(
+            "accessed_time",
+            LogicalTypeHandle::from(LogicalTypeId::Timestamp),
+        );
+        bind.add_result_column(
+            "created_time",
+            LogicalTypeHandle::from(LogicalTypeId::Timestamp),
+        );
+        bind.add_result_column(
+            "permissions",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
+        bind.add_result_column("inode", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        bind.add_result_column("is_file", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+        bind.add_result_column("is_dir", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+        bind.add_result_column(
+            "is_symlink",
+            LogicalTypeHandle::from(LogicalTypeId::Boolean),
+        );
+
+        let pattern = bind.get_parameter(0).to_string();
+        
+        // Default parameters for single-parameter version
+        let ignore_case = false;
+        let follow_symlinks = true;
+        let exclude_patterns = Vec::new();
+
+        // Use enhanced glob function with default parameters
+        let files = collect_files_with_options(&pattern, ignore_case, follow_symlinks, &exclude_patterns)?;
+
+        Ok(GlobStatBindData { 
+            pattern, 
+            ignore_case, 
+            follow_symlinks,
+            exclude_patterns,
+            files 
+        })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(GlobStatInitData {
+            current_index: AtomicUsize::new(0),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let init_data = func.get_init_data();
+        let bind_data = func.get_bind_data();
+
+        let current_idx = init_data.current_index.load(Ordering::Relaxed);
+
+        if current_idx >= bind_data.files.len() {
+            output.set_len(0);
+            return Ok(());
+        }
+
+        let file_meta = &bind_data.files[current_idx];
+
+        // Path (VARCHAR)
+        output.flat_vector(0).insert(0, file_meta.path.as_str());
+
+        // Size (BIGINT)
+        let mut size_vector = output.flat_vector(1);
+        let size_data = size_vector.as_mut_slice::<i64>();
+        size_data[0] = file_meta.size as i64;
+
+        // Modified time (TIMESTAMP)
+        let mut modified_vector = output.flat_vector(2);
+        let modified_data = modified_vector.as_mut_slice::<i64>();
+        modified_data[0] = file_meta.modified_time;
+
+        // Accessed time (TIMESTAMP)
+        let mut accessed_vector = output.flat_vector(3);
+        let accessed_data = accessed_vector.as_mut_slice::<i64>();
+        accessed_data[0] = file_meta.accessed_time;
+
+        // Created time (TIMESTAMP)
+        let mut created_vector = output.flat_vector(4);
+        let created_data = created_vector.as_mut_slice::<i64>();
+        created_data[0] = file_meta.created_time;
+
+        // Permissions (VARCHAR)
+        output
+            .flat_vector(5)
+            .insert(0, file_meta.permissions.as_str());
+
+        // Inode (BIGINT)
+        let mut inode_vector = output.flat_vector(6);
+        let inode_data = inode_vector.as_mut_slice::<i64>();
+        inode_data[0] = file_meta.inode as i64;
+
+        // Is file (BOOLEAN)
+        let mut is_file_vector = output.flat_vector(7);
+        let is_file_data = is_file_vector.as_mut_slice::<bool>();
+        is_file_data[0] = file_meta.is_file;
+
+        // Is directory (BOOLEAN)
+        let mut is_dir_vector = output.flat_vector(8);
+        let is_dir_data = is_dir_vector.as_mut_slice::<bool>();
+        is_dir_data[0] = file_meta.is_dir;
+
+        // Is symlink (BOOLEAN)
+        let mut is_symlink_vector = output.flat_vector(9);
+        let is_symlink_data = is_symlink_vector.as_mut_slice::<bool>();
+        is_symlink_data[0] = file_meta.is_symlink;
+
+        output.set_len(1);
+        init_data
+            .current_index
+            .store(current_idx + 1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // pattern (required)
         ])
     }
 }
 
 // Scalar-like functions implemented as table functions that return single rows
 
-fn collect_files_with_duckdb_glob(pattern: &str) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
+fn collect_files_with_duckdb_glob(pattern: &str, ignore_case: bool) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let mut results = Vec::new();
     let mut _error_count = 0;
 
     // Convert DuckDB glob patterns to Rust glob crate patterns
     let rust_pattern = normalize_glob_pattern(pattern);
 
-    // Use the glob crate for pattern matching
-    for entry in glob(&rust_pattern)? {
+    // Configure glob matching options
+    let match_options = MatchOptions {
+        case_sensitive: !ignore_case,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+
+    // Use the glob crate for pattern matching with case sensitivity option
+    for entry in glob_with(&rust_pattern, match_options)? {
         match entry {
             Ok(path) => {
                 // Try to get metadata, but don't fail the entire operation for permission errors
@@ -251,6 +488,103 @@ fn collect_files_with_duckdb_glob(pattern: &str) -> Result<Vec<FileMetadata>, Bo
 
     // For debugging: you could log error_count here
     // eprintln!("Processed {} files, {} errors", results.len(), error_count);
+
+    Ok(results)
+}
+
+// Enhanced file collection with symlink handling and exclude patterns
+fn collect_files_with_options(
+    pattern: &str, 
+    ignore_case: bool, 
+    follow_symlinks: bool, 
+    exclude_patterns: &[String]
+) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
+    let mut results = Vec::new();
+    let mut _error_count = 0;
+
+    // Convert DuckDB glob patterns to Rust glob crate patterns
+    let rust_pattern = normalize_glob_pattern(pattern);
+
+    // Configure glob matching options
+    let match_options = MatchOptions {
+        case_sensitive: !ignore_case,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+
+    // Compile exclude patterns for efficient matching
+    let compiled_excludes: Vec<glob::Pattern> = exclude_patterns
+        .iter()
+        .filter_map(|pattern| {
+            glob::Pattern::new(pattern).ok()
+        })
+        .collect();
+
+    // Use the glob crate for pattern matching with case sensitivity option
+    for entry in glob_with(&rust_pattern, match_options)? {
+        match entry {
+            Ok(path) => {
+                // Check if path should be excluded
+                let path_str = path.to_string_lossy();
+                let should_exclude = compiled_excludes.iter().any(|exclude_pattern| {
+                    exclude_pattern.matches(&path_str) || 
+                    exclude_pattern.matches(&path.file_name().unwrap_or_default().to_string_lossy())
+                });
+                
+                if should_exclude {
+                    continue;
+                }
+                
+                // Handle symlinks based on follow_symlinks setting
+                let metadata_result = if follow_symlinks {
+                    fs::metadata(&path)  // Follows symlinks
+                } else {
+                    fs::symlink_metadata(&path)  // Does not follow symlinks
+                };
+                
+                match metadata_result {
+                    Ok(metadata) => {
+                        // Skip symlinks if we're not following them and this is a symlink
+                        if !follow_symlinks && metadata.file_type().is_symlink() {
+                            continue;
+                        }
+                        
+                        let file_meta = FileMetadata {
+                            path: path.to_string_lossy().to_string(),
+                            size: metadata.len(),
+                            modified_time: system_time_to_microseconds(
+                                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                            ),
+                            accessed_time: system_time_to_microseconds(
+                                metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
+                            ),
+                            created_time: system_time_to_microseconds(
+                                metadata.created().unwrap_or_else(|_| {
+                                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+                                }),
+                            ),
+                            permissions: format_permissions(&metadata),
+                            inode: get_inode(&metadata),
+                            is_file: metadata.is_file(),
+                            is_dir: metadata.is_dir(),
+                            is_symlink: metadata.file_type().is_symlink(),
+                            hash: None, // No hash computation in glob_stat
+                        };
+
+                        results.push(file_meta);
+                    }
+                    Err(_) => {
+                        // Skip files we can't access (permission errors, etc.)
+                        _error_count += 1;
+                    }
+                }
+            }
+            Err(_) => {
+                // Skip entries that couldn't be processed
+                _error_count += 1;
+            }
+        }
+    }
 
     Ok(results)
 }
@@ -2735,6 +3069,11 @@ fn age_decrypt_passphrase(
 
 #[duckdb_entrypoint_c_api(ext_name = "file_tools")]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
+    // Register legacy single-parameter version
+    con.register_table_function::<GlobStatSingleVTab>("glob_stat_legacy")
+        .expect("Failed to register glob_stat_legacy table function");
+    
+    // Register new version with optional named parameters as the main glob_stat
     con.register_table_function::<GlobStatVTab>("glob_stat")
         .expect("Failed to register glob_stat table function");
 
@@ -2802,8 +3141,8 @@ mod tests {
         let pattern1 = "src/*.rs";
         let pattern2 = "Cargo.*";
 
-        let files1 = collect_files_with_duckdb_glob(pattern1).unwrap_or_default();
-        let files2 = collect_files_with_duckdb_glob(pattern2).unwrap_or_default();
+        let files1 = collect_files_with_duckdb_glob(pattern1, false).unwrap_or_default();
+        let files2 = collect_files_with_duckdb_glob(pattern2, false).unwrap_or_default();
 
         // Extract just the file paths for comparison
         let paths1: HashSet<_> = files1.iter().map(|f| &f.path).collect();

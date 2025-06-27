@@ -562,6 +562,7 @@ You can also find duckdb itself at docs/other-extensions/duckdb but because it's
 ## Best practices
 * avoid comments describing what the next line does
 * compile code after making a change, if can't make the code compile after 2 tries just prompt me back telling me that the code doesn't compile (otherwise I can assume it does compile)
+* don't be overly enthusiastic with things like "production grade", "professional grade", "high performance", etc ... this is experimental work
 
 ## Development Workflow - COMPLETED
 1. Set up Rust project based on duckdb-extension-template-rs

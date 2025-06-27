@@ -4,7 +4,11 @@ The File Tools extension provides functions for file system operations, metadata
 
 ## Latest Changes
 
-**v0.1.0 - Multi-Algorithm Compression & Runtime Debug Control**
+**v0.1.0 - Advanced Glob Options & Multi-Algorithm Compression**
+- ✅ **Advanced glob options**: Added `follow_symlinks`, `exclude` patterns, and `ignore_case` parameters to `glob_stat()`
+- ✅ **Exclude patterns**: Support for glob-style exclude patterns using array syntax (e.g., `exclude := ['*.tmp', '*.bak', 'node_modules/']`)
+- ✅ **Symlink control**: Configure whether to follow symbolic links with `follow_symlinks` parameter
+- ✅ **Case-insensitive glob matching**: Added `ignore_case` parameter for case-insensitive pattern matching
 - ✅ **Compression functions**: Added `compress()`, `compress_zstd()`, `compress_lz4()` and `decompress()` functions
 - ✅ **Runtime debug output**: Set `DUCKDB_FILE_TOOLS_DEBUG=1` to enable detailed performance instrumentation
 - ✅ **New jwalk implementation**: Added `glob_stat_sha256_jwalk` as alternative parallel implementation
@@ -20,17 +24,25 @@ Both builds support runtime debug output via `DUCKDB_FILE_TOOLS_DEBUG=1` environ
 
 ## Table Functions
 
-### `glob_stat(pattern)`
+### `glob_stat(pattern, ignore_case, follow_symlinks, exclude)`
 
-Scans files matching a glob pattern and returns metadata for each file.
+Scans files matching a glob pattern and returns metadata for each file. Supports optional named parameters for advanced filtering and control.
 
 **Syntax**
 ```sql
-SELECT * FROM glob_stat(pattern)
+SELECT * FROM glob_stat(
+    pattern,
+    ignore_case := false,
+    follow_symlinks := true,
+    exclude := []
+)
 ```
 
 **Parameters**
 - `pattern` (`VARCHAR`): A glob pattern to match files (e.g., `'*.txt'`, `'data/**/*.csv'`)
+- `ignore_case` (`BOOLEAN`, optional): Whether to perform case-insensitive pattern matching (default: `false`)
+- `follow_symlinks` (`BOOLEAN`, optional): Whether to follow symbolic links (default: `true`) 
+- `exclude` (`LIST(VARCHAR)`, optional): Array of glob patterns to exclude from results (default: `[]`)
 
 **Returns**
 A table with the following columns:
@@ -45,9 +57,9 @@ A table with the following columns:
 - `is_dir` (`VARCHAR`): Whether the entry is a directory
 - `is_symlink` (`VARCHAR`): Whether the entry is a symbolic link
 
-**Example**
+**Examples**
 ```sql
--- List all CSV files in the current directory with metadata
+-- Simple usage - list all CSV files with default settings
 SELECT path, size, modified_time 
 FROM glob_stat('*.csv');
 
@@ -55,7 +67,77 @@ FROM glob_stat('*.csv');
 SELECT path, size 
 FROM glob_stat('**/*') 
 WHERE CAST(size AS BIGINT) > 1000000;
+
+-- Basic file listing with metadata
+SELECT path, is_file, is_dir 
+FROM glob_stat('data/**/*');
 ```
+
+### `glob_stat_legacy(pattern)`
+
+A simpler version of `glob_stat()` without optional parameters, useful for basic file listing and testing.
+
+**Syntax**
+```sql
+SELECT * FROM glob_stat_legacy(pattern)
+```
+
+**Parameters**
+- `pattern` (`VARCHAR`): A glob pattern to match files
+
+**Returns**
+Same columns as `glob_stat()` with default behavior (case-sensitive, follows symlinks, no excludes).
+
+**Examples**
+```sql
+-- Case-insensitive matching (.txt, .TXT, .Txt, etc.)
+SELECT path FROM glob_stat('**/*.txt', ignore_case := true);
+
+-- Exclude temporary and backup files
+SELECT path FROM glob_stat(
+    '**/*', 
+    exclude := ['*.tmp', '*.bak', '*.log', '.git/', 'node_modules/']
+);
+
+-- Don't follow symbolic links
+SELECT path, is_symlink FROM glob_stat(
+    '/data/**/*', 
+    follow_symlinks := false
+);
+
+-- Complex example: case-insensitive, no symlinks, exclude patterns
+SELECT path, size FROM glob_stat(
+    'projects/**/*.{TXT,CSV}',
+    ignore_case := true,
+    follow_symlinks := false,
+    exclude := ['temp/', '*.tmp', '.git/', 'node_modules/', '*.log']
+) WHERE CAST(size AS BIGINT) > 1000;
+
+-- Compare with and without excludes
+SELECT 'all files' as category, count(*) as file_count
+FROM glob_stat('**/*')
+UNION ALL
+SELECT 'filtered files' as category, count(*) as file_count  
+FROM glob_stat('**/*', exclude := ['*.tmp', '.git/', 'node_modules/']);
+
+-- Simple glob_stat_legacy for testing without options
+SELECT path, size FROM glob_stat_legacy('*.csv');
+```
+
+**Exclude Pattern Features**
+- **File extensions**: `'*.tmp'`, `'*.log'`, `'*.{jpg,png,gif}'`
+- **Directories**: `'temp/'`, `'.git/'`, `'node_modules/'` (trailing slash recommended)
+- **Path patterns**: `'**/temp/*'`, `'build/**'`, `'target/'`
+- **Common excludes**: `['.git/', '.svn/', 'node_modules/', 'target/', '*.tmp', '*.log', '*.bak']`
+
+**Symlink Behavior**
+- `follow_symlinks := true` (default): Follows symlinks and reports target file metadata
+- `follow_symlinks := false`: Excludes symlinks from results entirely
+
+**Performance Notes**
+- Exclude patterns use compiled glob matching for efficiency
+- Directory-level excludes (e.g., `'temp/'`) skip entire subtrees for better performance
+- Case-insensitive matching may be slower on large datasets
 
 
 ### `glob_stat_sha256_parallel(pattern)`
