@@ -266,12 +266,6 @@ TODO: what compression method to use ? should it be pluggable ? what is a good r
    - Handles any file type (text, binary, images, etc.)
    - Can be combined with compression and processing functions
 
-**Planned Enhancements - PENDING**
-1. exclude pattern: skip files matching a glob, for example `'.git/**'` would skip all git repos
-2. ignore_case true/false for file name matching, for example `'*.csv'` would match .csv or .CSV  
-5. `permission_errors` optional argument can be 'ignore', 'print', 'fail' (default is 'ignore')
-6. `symlink` optional argument can be 'follow', 'skip' (default is 'skip') - follow will include loop detection when implemented
-
 #### Phase 5: Age Encryption Integration - **IMPLEMENTED**
 
 **Age Encryption/Decryption API Implementation**
@@ -495,6 +489,35 @@ FROM (SELECT age_keygen(0) AS keys);
 - Maintains same performance characteristics as existing functions
 - Supports both binary and text-based workflows
 - Secret name detection ready for future FFI implementation
+
+#### 6. misc - PENDING
+
+Current stack:
+* file_tools compilation warnings, unused code
+* github CI issues
+* split lib.rs into: lib.rs (common), glob.rs (metadata and crawl), file.rs, compress.rs, age_encryption.rs
+* is it possible to do named/optional arguments like read_csv ?
+    * would be great for ignoring case, exclude/include patterns, symlink, etc ... (i.e. most items in next sections of todo)
+
+#### 7. enhancements - PENDING
+
+**Planned Enhancements - PENDING**
+1. exclude pattern: skip files matching a glob, for example `'.git/**'` would skip all git repos
+2. ignore_case true/false for file name matching, for example `'*.csv'` would match .csv or .CSV
+5. `permission_errors` optional argument can be 'ignore', 'print', 'fail' (default is 'ignore')
+6. `symlink` optional argument can be 'follow', 'skip' (default is 'skip') - follow will include loop detection when implemented
+
+#### 8. exif / media
+* support exif extraction
+* TODO: review library choices:
+    * if best libraries are in Rust implement them here
+    * else create duckdb-extension-exif/media metadata
+* goals:
+    * photo/video camera make and model, size
+    * ctime, mtime
+    * geo-location extraction
+* execute in parallel for performance
+    * need a way to batch on huge media trees
 
 ### Performance Considerations
 - **Parallel Processing**: Leverage jwalk's parallel directory traversal
