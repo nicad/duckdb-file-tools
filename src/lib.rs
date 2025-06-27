@@ -113,21 +113,22 @@ impl VTab for GlobStatVTab {
         );
 
         let pattern = bind.get_parameter(0).to_string();
-        
+
         // Get all parameters (named or with defaults)
         let ignore_case = get_ignore_case_parameter(bind).unwrap_or(false);
         let follow_symlinks = get_follow_symlinks_parameter(bind).unwrap_or(true);
         let exclude_patterns = get_exclude_patterns(bind).unwrap_or_default();
 
         // Use enhanced glob function with new parameters
-        let files = collect_files_with_options(&pattern, ignore_case, follow_symlinks, &exclude_patterns)?;
+        let files =
+            collect_files_with_options(&pattern, ignore_case, follow_symlinks, &exclude_patterns)?;
 
-        Ok(GlobStatBindData { 
-            pattern, 
-            ignore_case, 
+        Ok(GlobStatBindData {
+            pattern,
+            ignore_case,
             follow_symlinks,
             exclude_patterns,
-            files 
+            files,
         })
     }
 
@@ -240,7 +241,7 @@ fn get_ignore_case_parameter(bind: &BindInfo) -> Result<bool, Box<dyn std::error
         let ignore_case_str = named_value.to_string();
         return Ok(ignore_case_str.to_lowercase() == "true");
     }
-    
+
     // Fallback: check for positional parameter
     if bind.get_parameter_count() > 1 {
         let ignore_case_param = bind.get_parameter(1).to_string();
@@ -258,7 +259,7 @@ fn get_follow_symlinks_parameter(bind: &BindInfo) -> Result<bool, Box<dyn std::e
         let follow_symlinks_str = named_value.to_string();
         return Ok(follow_symlinks_str.to_lowercase() == "true");
     }
-    
+
     // Default value: true (current behavior is to follow symlinks)
     Ok(true)
 }
@@ -269,12 +270,12 @@ fn get_exclude_patterns(bind: &BindInfo) -> Result<Vec<String>, Box<dyn std::err
     if let Some(named_value) = bind.get_named_parameter("exclude") {
         // Handle list of strings
         let exclude_str = named_value.to_string();
-        
+
         // Parse the list format from DuckDB (likely something like "[pattern1, pattern2, ...]")
         // For now, let's handle both single strings and basic list formats
         if exclude_str.starts_with('[') && exclude_str.ends_with(']') {
             // Parse as list
-            let inner = &exclude_str[1..exclude_str.len()-1];
+            let inner = &exclude_str[1..exclude_str.len() - 1];
             let patterns: Vec<String> = inner
                 .split(',')
                 .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
@@ -286,11 +287,10 @@ fn get_exclude_patterns(bind: &BindInfo) -> Result<Vec<String>, Box<dyn std::err
             return Ok(vec![exclude_str]);
         }
     }
-    
+
     // Default: no exclusions
     Ok(Vec::new())
 }
-
 
 // Single-parameter implementation of glob_stat (ignore_case defaults to false)
 impl VTab for GlobStatSingleVTab {
@@ -326,21 +326,22 @@ impl VTab for GlobStatSingleVTab {
         );
 
         let pattern = bind.get_parameter(0).to_string();
-        
+
         // Default parameters for single-parameter version
         let ignore_case = false;
         let follow_symlinks = true;
         let exclude_patterns = Vec::new();
 
         // Use enhanced glob function with default parameters
-        let files = collect_files_with_options(&pattern, ignore_case, follow_symlinks, &exclude_patterns)?;
+        let files =
+            collect_files_with_options(&pattern, ignore_case, follow_symlinks, &exclude_patterns)?;
 
-        Ok(GlobStatBindData { 
-            pattern, 
-            ignore_case, 
+        Ok(GlobStatBindData {
+            pattern,
+            ignore_case,
             follow_symlinks,
             exclude_patterns,
-            files 
+            files,
         })
     }
 
@@ -432,7 +433,10 @@ impl VTab for GlobStatSingleVTab {
 // Scalar-like functions implemented as table functions that return single rows
 
 #[allow(dead_code)]
-fn collect_files_with_duckdb_glob(pattern: &str, ignore_case: bool) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
+fn collect_files_with_duckdb_glob(
+    pattern: &str,
+    ignore_case: bool,
+) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let mut results = Vec::new();
     let mut _error_count = 0;
 
@@ -498,10 +502,10 @@ fn collect_files_with_duckdb_glob(pattern: &str, ignore_case: bool) -> Result<Ve
 
 // Enhanced file collection with symlink handling and exclude patterns
 fn collect_files_with_options(
-    pattern: &str, 
-    ignore_case: bool, 
-    follow_symlinks: bool, 
-    exclude_patterns: &[String]
+    pattern: &str,
+    ignore_case: bool,
+    follow_symlinks: bool,
+    exclude_patterns: &[String],
 ) -> Result<Vec<FileMetadata>, Box<dyn Error>> {
     let mut results = Vec::new();
     let mut _error_count = 0;
@@ -519,9 +523,7 @@ fn collect_files_with_options(
     // Compile exclude patterns for efficient matching
     let compiled_excludes: Vec<glob::Pattern> = exclude_patterns
         .iter()
-        .filter_map(|pattern| {
-            glob::Pattern::new(pattern).ok()
-        })
+        .filter_map(|pattern| glob::Pattern::new(pattern).ok())
         .collect();
 
     // Use the glob crate for pattern matching with case sensitivity option
@@ -531,28 +533,29 @@ fn collect_files_with_options(
                 // Check if path should be excluded
                 let path_str = path.to_string_lossy();
                 let should_exclude = compiled_excludes.iter().any(|exclude_pattern| {
-                    exclude_pattern.matches(&path_str) || 
-                    exclude_pattern.matches(&path.file_name().unwrap_or_default().to_string_lossy())
+                    exclude_pattern.matches(&path_str)
+                        || exclude_pattern
+                            .matches(&path.file_name().unwrap_or_default().to_string_lossy())
                 });
-                
+
                 if should_exclude {
                     continue;
                 }
-                
+
                 // Handle symlinks based on follow_symlinks setting
                 let metadata_result = if follow_symlinks {
-                    fs::metadata(&path)  // Follows symlinks
+                    fs::metadata(&path) // Follows symlinks
                 } else {
-                    fs::symlink_metadata(&path)  // Does not follow symlinks
+                    fs::symlink_metadata(&path) // Does not follow symlinks
                 };
-                
+
                 match metadata_result {
                     Ok(metadata) => {
                         // Skip symlinks if we're not following them and this is a symlink
                         if !follow_symlinks && metadata.file_type().is_symlink() {
                             continue;
                         }
-                        
+
                         let file_meta = FileMetadata {
                             path: path.to_string_lossy().to_string(),
                             size: metadata.len(),
@@ -850,9 +853,18 @@ impl VTab for GlobStatSha256ParallelVTab {
 
     fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
         Some(vec![
-            ("ignore_case".to_string(), LogicalTypeHandle::from(LogicalTypeId::Boolean)),
-            ("follow_symlinks".to_string(), LogicalTypeHandle::from(LogicalTypeId::Boolean)),
-            ("exclude".to_string(), LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar))),
+            (
+                "ignore_case".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Boolean),
+            ),
+            (
+                "follow_symlinks".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Boolean),
+            ),
+            (
+                "exclude".to_string(),
+                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ),
         ])
     }
 
@@ -886,14 +898,19 @@ impl VTab for GlobStatSha256ParallelVTab {
         bind.add_result_column("hash", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
         let pattern = bind.get_parameter(0).to_string();
-        
+
         // Get optional named parameters using helper functions
         let ignore_case = get_ignore_case_parameter(bind)?;
         let follow_symlinks = get_follow_symlinks_parameter(bind)?;
         let exclude_patterns = get_exclude_patterns(bind)?;
 
         // Use parallel file collection with hash computation and optional parameters
-        let files = collect_files_with_parallel_hashing(&pattern, ignore_case, follow_symlinks, &exclude_patterns)?;
+        let files = collect_files_with_parallel_hashing(
+            &pattern,
+            ignore_case,
+            follow_symlinks,
+            &exclude_patterns,
+        )?;
 
         Ok(GlobStatSha256ParallelBindData { pattern, files })
     }
@@ -1008,7 +1025,7 @@ fn collect_files_with_parallel_hashing(
         require_literal_separator: false,
         require_literal_leading_dot: false,
     };
-    
+
     let file_paths: Vec<_> = if ignore_case {
         glob_with(&rust_pattern, match_options)?
     } else {
@@ -1042,17 +1059,23 @@ fn collect_files_with_parallel_hashing(
     let metadata_count_start = Instant::now();
     let (file_count, dir_count, error_count) = file_paths
         .par_iter()
-        .map(|path| match if follow_symlinks { fs::metadata(path) } else { fs::symlink_metadata(path) } {
-            Ok(meta) => {
-                if meta.is_file() {
-                    (1, 0, 0)
-                } else if meta.is_dir() {
-                    (0, 1, 0)
-                } else {
-                    (0, 0, 0)
+        .map(|path| {
+            match if follow_symlinks {
+                fs::metadata(path)
+            } else {
+                fs::symlink_metadata(path)
+            } {
+                Ok(meta) => {
+                    if meta.is_file() {
+                        (1, 0, 0)
+                    } else if meta.is_dir() {
+                        (0, 1, 0)
+                    } else {
+                        (0, 0, 0)
+                    }
                 }
+                Err(_) => (0, 0, 1),
             }
-            Err(_) => (0, 0, 1),
         })
         .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
 
@@ -1081,11 +1104,15 @@ fn collect_files_with_parallel_hashing(
             let item_start = Instant::now();
 
             // Get metadata first - use robust error handling like the sequential version
-            let metadata = match if follow_symlinks { fs::metadata(&path) } else { fs::symlink_metadata(&path) } {
+            let metadata = match if follow_symlinks {
+                fs::metadata(&path)
+            } else {
+                fs::symlink_metadata(&path)
+            } {
                 Ok(meta) => meta,
                 Err(_) => return None, // Skip files we can't access
             };
-            
+
             // Skip symlinks if follow_symlinks is false and this is a symlink
             if !follow_symlinks && metadata.file_type().is_symlink() {
                 return None;
@@ -1181,9 +1208,18 @@ impl VTab for GlobStatSha256JwalkVTab {
 
     fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
         Some(vec![
-            ("ignore_case".to_string(), LogicalTypeHandle::from(LogicalTypeId::Boolean)),
-            ("follow_symlinks".to_string(), LogicalTypeHandle::from(LogicalTypeId::Boolean)),
-            ("exclude".to_string(), LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar))),
+            (
+                "ignore_case".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Boolean),
+            ),
+            (
+                "follow_symlinks".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Boolean),
+            ),
+            (
+                "exclude".to_string(),
+                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ),
         ])
     }
 
@@ -1217,14 +1253,19 @@ impl VTab for GlobStatSha256JwalkVTab {
         bind.add_result_column("hash", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
         let pattern = bind.get_parameter(0).to_string();
-        
+
         // Get optional named parameters using helper functions
         let ignore_case = get_ignore_case_parameter(bind)?;
         let follow_symlinks = get_follow_symlinks_parameter(bind)?;
         let exclude_patterns = get_exclude_patterns(bind)?;
 
         // Use jwalk for parallel directory walking with optional parameters
-        let files = collect_files_with_jwalk_parallel(&pattern, ignore_case, follow_symlinks, &exclude_patterns)?;
+        let files = collect_files_with_jwalk_parallel(
+            &pattern,
+            ignore_case,
+            follow_symlinks,
+            &exclude_patterns,
+        )?;
 
         Ok(GlobStatSha256JwalkBindData { pattern, files })
     }
@@ -1368,7 +1409,7 @@ fn collect_files_with_jwalk_parallel(
     };
     let glob_pattern = glob::Pattern::new(&rust_pattern)?;
     // Note: glob crate doesn't support case-insensitive patterns, so we'll handle case manually if needed
-    
+
     let matching_paths: Vec<_> = all_paths
         .into_iter()
         .filter(|path| {
@@ -1383,11 +1424,11 @@ fn collect_files_with_jwalk_parallel(
                 } else {
                     glob_pattern.matches(path_str)
                 };
-                
+
                 if !matches_pattern {
                     return false;
                 }
-                
+
                 // Then check if it matches any exclude patterns
                 !exclude_patterns.iter().any(|pattern| {
                     if ignore_case {
@@ -1487,17 +1528,23 @@ fn collect_files_with_jwalk_parallel(
     let count_start = Instant::now();
     let (file_count, dir_count, error_count) = matching_paths
         .par_iter()
-        .map(|path| match if follow_symlinks { fs::metadata(path) } else { fs::symlink_metadata(path) } {
-            Ok(meta) => {
-                if meta.is_file() {
-                    (1, 0, 0)
-                } else if meta.is_dir() {
-                    (0, 1, 0)
-                } else {
-                    (0, 0, 0)
+        .map(|path| {
+            match if follow_symlinks {
+                fs::metadata(path)
+            } else {
+                fs::symlink_metadata(path)
+            } {
+                Ok(meta) => {
+                    if meta.is_file() {
+                        (1, 0, 0)
+                    } else if meta.is_dir() {
+                        (0, 1, 0)
+                    } else {
+                        (0, 0, 0)
+                    }
                 }
+                Err(_) => (0, 0, 1),
             }
-            Err(_) => (0, 0, 1),
         })
         .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
 
@@ -1523,11 +1570,15 @@ fn collect_files_with_jwalk_parallel(
             let item_start = Instant::now();
 
             // Get metadata first
-            let metadata = match if follow_symlinks { fs::metadata(&path) } else { fs::symlink_metadata(&path) } {
+            let metadata = match if follow_symlinks {
+                fs::metadata(&path)
+            } else {
+                fs::symlink_metadata(&path)
+            } {
                 Ok(meta) => meta,
                 Err(_) => return None,
             };
-            
+
             // Skip symlinks if follow_symlinks is false and this is a symlink
             if !follow_symlinks && metadata.file_type().is_symlink() {
                 return None;
@@ -3193,7 +3244,7 @@ fn age_decrypt_passphrase(
 
 #[duckdb_entrypoint_c_api(ext_name = "file_tools")]
 /// # Safety
-/// 
+///
 /// This function is called by the DuckDB extension loading mechanism.
 /// It must only be called from DuckDB's extension loader with a valid Connection.
 /// The caller is responsible for ensuring the Connection remains valid for the
@@ -3202,7 +3253,7 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     // Register legacy single-parameter version
     con.register_table_function::<GlobStatSingleVTab>("glob_stat_legacy")
         .expect("Failed to register glob_stat_legacy table function");
-    
+
     // Register new version with optional named parameters as the main glob_stat
     con.register_table_function::<GlobStatVTab>("glob_stat")
         .expect("Failed to register glob_stat table function");
