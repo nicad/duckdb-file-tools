@@ -1,6 +1,6 @@
 # DuckDB File Tools Extension
 
-[![Build Status](https://github.com/yourusername/duckdb-file-tools/workflows/CI/badge.svg)](https://github.com/yourusername/duckdb-file-tools/actions)
+[![Build Status](https://github.com/nicad/duckdb-file-tools/workflows/CI/badge.svg)](https://github.com/nicad/duckdb-file-tools/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A DuckDB extension written in Rust that provides file system operations, metadata extraction, compression, and planned Age encryption support.
