@@ -493,19 +493,19 @@ FROM (SELECT age_keygen(0) AS keys);
 #### 6. misc - PENDING
 
 Current stack:
-* file_tools compilation warnings, unused code
-* github CI issues
+[X] file_tools compilation warnings, unused code
+[X] github CI issues
 * split lib.rs into: lib.rs (common), glob.rs (metadata and crawl), file.rs, compress.rs, age_encryption.rs
-* is it possible to do named/optional arguments like read_csv ?
+[X] is it possible to do named/optional arguments like read_csv ?
     * would be great for ignoring case, exclude/include patterns, symlink, etc ... (i.e. most items in next sections of todo)
 
 #### 7. enhancements - PENDING
 
 **Planned Enhancements - PENDING**
-1. exclude pattern: skip files matching a glob, for example `'.git/**'` would skip all git repos
-2. ignore_case true/false for file name matching, for example `'*.csv'` would match .csv or .CSV
+[C] exclude pattern: skip files matching a glob, for example `'.git/**'` would skip all git repos
+[X] ignore_case true/false for file name matching, for example `'*.csv'` would match .csv or .CSV
 5. `permission_errors` optional argument can be 'ignore', 'print', 'fail' (default is 'ignore')
-6. `symlink` optional argument can be 'follow', 'skip' (default is 'skip') - follow will include loop detection when implemented
+[X] `symlink` optional argument can be 'follow', 'skip' (default is 'skip') - follow will include loop detection when implemented
 
 #### 8. exif / media
 * support exif extraction
