@@ -5,8 +5,6 @@ extern crate duckdb;
 extern crate duckdb_loadable_macros;
 extern crate libduckdb_sys;
 
-use age::secrecy::{ExposeSecret, SecretString};
-use age::{scrypt, x25519};
 use duckdb::types::DuckString;
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
@@ -3295,18 +3293,6 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_scalar_function::<CompressLz4Scalar>("compress_lz4")
         .expect("Failed to register compress_lz4 scalar function");
 
-    // Age encryption functions
-    con.register_scalar_function::<AgeKeygenScalar>("age_keygen")?;
-    con.register_scalar_function::<AgeKeygenSecretScalar>("age_keygen_secret")?;
-
-    // Register single VARCHAR (calls _multi internally) and VARCHAR[] array versions
-    con.register_scalar_function::<AgeEncryptSingleScalar>("age_encrypt")?;
-    con.register_scalar_function::<AgeEncryptMultiScalar>("age_encrypt_multi")?;
-    con.register_scalar_function::<AgeEncryptPassphraseScalar>("age_encrypt_passphrase")?;
-
-    con.register_scalar_function::<AgeDecryptSingleScalar>("age_decrypt")?;
-    con.register_scalar_function::<AgeDecryptMultiScalar>("age_decrypt_multi")?;
-    con.register_scalar_function::<AgeDecryptPassphraseScalar>("age_decrypt_passphrase")?;
 
     Ok(())
 }

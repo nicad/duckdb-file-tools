@@ -539,6 +539,100 @@ FROM glob_stat('config/*.txt')
 WHERE is_file = true;
 ```
 
+### `file_exists(filename)`
+
+Checks if a path exists and is specifically a file (not a directory or other type).
+
+**Syntax**
+```sql
+file_exists(filename)
+```
+
+**Parameters**
+- `filename` (`VARCHAR`): Path to check
+
+**Returns**
+- `TRUE`: If the path exists and is a regular file
+- `FALSE`: If the path doesn't exist
+- `NULL`: If the path exists but is not a file (e.g., directory, symlink, device)
+
+**Example**
+```sql
+-- Check if specific files exist
+SELECT 
+    filename,
+    file_exists(filename) AS is_file
+FROM (VALUES 
+    ('config.json'),      -- returns TRUE if it's a file
+    ('data/'),           -- returns NULL (it's a directory)
+    ('missing.txt')      -- returns FALSE (doesn't exist)
+) AS t(filename);
+
+-- Only process existing files
+SELECT 
+    path,
+    file_read_text(path) AS content
+FROM glob_stat('*.conf')
+WHERE file_exists(path) = TRUE;
+
+-- Find missing required files
+SELECT filename
+FROM (VALUES ('config.json'), ('data.csv'), ('schema.sql')) AS required(filename)
+WHERE file_exists(filename) = FALSE;
+```
+
+### `path_exists(pathname)`
+
+Checks if a path exists, regardless of its type (file, directory, symlink, etc.).
+
+**Syntax**
+```sql
+path_exists(pathname)
+```
+
+**Parameters**
+- `pathname` (`VARCHAR`): Path to check
+
+**Returns**
+- `TRUE`: If the path exists (any type)
+- `FALSE`: If the path doesn't exist
+
+**Example**
+```sql
+-- Check if paths exist
+SELECT 
+    path,
+    path_exists(path) AS exists,
+    file_exists(path) AS is_file
+FROM (VALUES 
+    ('config.json'),     -- TRUE, TRUE (if it's a file)
+    ('data/'),          -- TRUE, NULL (exists but is directory)
+    ('missing.txt')     -- FALSE, FALSE
+) AS t(path);
+
+-- Ensure directory exists before reading files
+SELECT 
+    CASE 
+        WHEN path_exists('data/') THEN 'Directory exists'
+        ELSE 'Directory missing'
+    END AS status;
+
+-- Check multiple paths
+SELECT 
+    path,
+    path_exists(path) AS exists,
+    CASE 
+        WHEN NOT path_exists(path) THEN 'Missing'
+        WHEN file_exists(path) = TRUE THEN 'File'
+        WHEN file_exists(path) IS NULL THEN 'Directory/Other'
+    END AS type
+FROM (VALUES 
+    ('/etc/passwd'),
+    ('/tmp/'),
+    ('/nonexistent')
+) AS t(path);
+```
+
 ### `path_parts(path)`
 
 Decomposes a file path into its constituent components with cross-platform support.
@@ -1628,6 +1722,112 @@ FROM dek;
    ```sql
    -- Generate the SQL statement
    SELECT age_keygen_secret('my_keys') AS create_statement;
+
+## Secret Integration Status
+
+The file_tools extension includes infrastructure for integrating with DuckDB's secret management system but requires a custom DuckDB build with secret FFI support.
+
+### Current Implementation
+
+**✅ Working Features:**
+- All age encryption/decryption functions work with direct keys
+- Key generation (`age_keygen`, `age_keygen_secret`)
+- Multi-recipient encryption support
+- Passphrase-based encryption
+- Complete encryption/decryption workflows
+
+**🔧 Secret Integration (In Development):**
+- `age_create_secret(name, key_data)` - Creates secrets (placeholder)
+- `age_encrypt_with_secret(data, secret_name)` - Encrypt using secret name (placeholder)
+- `age_decrypt_with_secret(data, secret_name)` - Decrypt using secret name (placeholder)
+
+### Testing Secret Functions
+
+Current secret functions return placeholder results:
+
+```sql
+-- Secret creation (returns placeholder message)
+SELECT age_create_secret('my_key', 'AGE-SECRET-KEY-1...');
+-- Returns: "Secret creation not available in scalar context"
+
+-- Secret-based encryption (returns NULL)
+SELECT age_encrypt_with_secret('Hello'::BLOB, 'my_key');
+-- Returns: NULL
+
+-- Secret-based decryption (returns NULL)  
+SELECT age_decrypt_with_secret(encrypted_data, 'my_key');
+-- Returns: NULL
+```
+
+### Architecture Overview
+
+The extension includes a C bridge (`src/secret_bridge.c`) that provides the interface for:
+- `duckdb_register_age_secret_type()` - Register 'age' as a secret type
+- `duckdb_create_age_secret()` - Create age secrets in DuckDB's secret store
+- `duckdb_get_age_secret()` - Retrieve age secrets by name
+- `extract_raw_connection()` - Extract connection handle for C API access
+
+### Integration with Custom DuckDB
+
+When using the custom DuckDB build at `/Users/nicolas/projects/duckdb-claude`:
+
+```bash
+# Build extension with secret support
+make debug
+
+# Test with custom DuckDB
+/Users/nicolas/projects/duckdb-claude/build/debug/duckdb -unsigned
+```
+
+The extension automatically attempts to register the 'age' secret type during loading.
+
+### Future Secret Workflow
+
+Once secret integration is complete, the intended workflow will be:
+
+```sql
+-- 1. Generate keys
+SELECT age_keygen(0) AS keys;
+
+-- 2. Create a secret (will work with custom DuckDB)
+CREATE SECRET my_company_key (
+    TYPE 'age',
+    PRIVATE_KEY 'AGE-SECRET-KEY-1GFPYYSJZPMJEGQGW87G3RL9ENRWQEJU8VFNLG8CKSR9QX9LYAGG9Q3G8D9X'
+);
+
+-- 3. Use secret name instead of raw keys
+SELECT age_encrypt_with_secret('sensitive data'::BLOB, 'my_company_key');
+SELECT age_decrypt_with_secret(encrypted_data, 'my_company_key');
+
+-- 4. Secrets work across sessions
+-- No need to re-enter keys, they're stored securely in DuckDB
+```
+
+### Current Workarounds
+
+Until secret integration is complete, use these approaches:
+
+1. **Direct key usage** (recommended for now):
+   ```sql
+   WITH keys AS (SELECT age_keygen(0) AS kp)
+   SELECT 
+       age_encrypt('data'::BLOB, kp.public_key) AS encrypted,
+       age_decrypt(encrypted, kp.private_key)::VARCHAR AS decrypted
+   FROM keys;
+   ```
+
+2. **Key storage in tables**:
+   ```sql
+   CREATE TABLE secure_keys (
+       key_name VARCHAR PRIMARY KEY,
+       public_key VARCHAR,
+       private_key VARCHAR
+   );
+   
+   INSERT INTO secure_keys 
+   SELECT 'main_key', k.public_key, k.private_key
+   FROM (SELECT age_keygen(0) AS k);
+   ```
    -- Returns: CREATE SECRET my_keys (TYPE age, PUBLIC_KEY 'age1...', PRIVATE_KEY 'AGE-SECRET-KEY-1...');
    
    -- Copy and paste the returned SQL to execute when C++ registration is available

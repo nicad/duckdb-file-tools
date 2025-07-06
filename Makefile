@@ -9,7 +9,10 @@ EXTENSION_NAME=file_tools
 USE_UNSTABLE_C_API=1
 
 # Target DuckDB version
-TARGET_DUCKDB_VERSION=v1.3.1
+TARGET_DUCKDB_VERSION=828439e464
+# TARGET_DUCKDB_VERSION=custom
+# CHANGED: For custom duckdb local build:
+# TARGET_DUCKDB_VERSION=v1.4.0
 
 all: configure debug
 

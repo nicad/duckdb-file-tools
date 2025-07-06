@@ -412,6 +412,7 @@ Age encryption can be useful in the following scenarios:
 ```sql
 CREATE SECRET key_name (
     TYPE age,
+    KEY_ID 'name1',
     PUBLIC_KEY 'age1...',
     PRIVATE_KEY 'AGE-SECRET-KEY-1...'  -- optional
 );
@@ -559,6 +560,10 @@ these extensions can be found locally at docs/other-extensions/
 
 You can also find duckdb itself at docs/other-extensions/duckdb but because it's a big code base only read what is needed from it.
 
+## Special Duckdb build
+* in case new APIs need to be added to DuckDb you can access this build at: docs/special-build/
+    * for example for create secret FFI for type 'age'
+
 ## Best practices
 * avoid comments describing what the next line does
 * compile code after making a change, if can't make the code compile after 2 tries just prompt me back telling me that the code doesn't compile (otherwise I can assume it does compile)
@@ -628,3 +633,146 @@ duckdb -unsigned -cmd "load './build/release/file_tools.duckdb_extension';"
 select * from glob_stat_sha256_parallel('/Users/nicolas/Downloads/*.pdf');
 select * from glob_stat_sha256_jwalk('/Users/nicolas/Downloads/*.pdf');
 ```
+
+## TODO: use new FFI for age secret
+
+ How to Link with Custom DuckDB Build
+
+  1. Build Configuration Changes
+
+  You'll need to modify the build configuration to use your custom DuckDB instead of the crates.io version:
+
+  In Cargo.toml:
+  ```
+  [dependencies]
+  # Comment out or remove the crates.io versions
+  # duckdb = "1.3.1"
+  # libduckdb-sys = "1.3.1"
+
+  # Use local path to your custom DuckDB Rust bindings
+  duckdb = { path = "/path/to/your/custom-duckdb-rs" }
+  libduckdb-sys = { path = "/path/to/your/custom-duckdb-sys" }
+  ```
+
+  Alternative approach using git:
+  [dependencies]
+  duckdb = { git = "https://github.com/your-username/duckdb-rs", branch = "custom-secrets-ffi" }
+  libduckdb-sys = { git = "https://github.com/your-username/duckdb-sys", branch = "custom-secrets-ffi" }
+
+  2. Custom DuckDB Rust Bindings Requirements
+
+  Your custom DuckDB Rust bindings need to expose the new C FFI functions for secret management:
+  ```
+  // In libduckdb-sys/src/lib.rs or similar
+  extern "C" {
+      // Secret registration functions
+      pub fn duckdb_register_secret_type(
+          connection: duckdb_connection,
+          secret_type: *const c_char,
+          // ... other parameters for secret callbacks
+      ) -> duckdb_state;
+
+      pub fn duckdb_create_secret(
+          connection: duckdb_connection,
+          secret_name: *const c_char,
+          secret_type: *const c_char,
+          secret_data: *const c_void,
+      ) -> duckdb_state;
+
+      // Additional secret management functions as needed
+  }
+  ```
+  3. Extension Code Changes for Secret Integration
+
+  You would modify the age encryption functions to use the secret system:
+
+  // In the age encryption functions
+  unsafe fn age_encrypt_with_secret(
+      secret_name: &str,
+      data: &[u8],
+      connection: duckdb_connection,
+  ) -> Result<Vec<u8>, Box<dyn Error>> {
+      // Retrieve secret from DuckDB's secret store
+      let secret_cstr = CString::new(secret_name)?;
+
+      // Use custom FFI to get secret
+      let secret_data = duckdb_get_secret(connection, secret_cstr.as_ptr());
+
+      if secret_data.is_null() {
+          return Err(format!("Secret '{}' not found", secret_name).into());
+      }
+
+      // Convert secret data to age key and encrypt
+      // ... existing encryption logic
+  }
+
+  4. Build Environment Setup
+
+  Environment Variables:
+  # Point to your custom DuckDB installation
+  export DUCKDB_LIB_DIR="/path/to/your/custom-duckdb/build/release/src"
+  export DUCKDB_INCLUDE_DIR="/path/to/your/custom-duckdb/src/include"
+
+  # Ensure custom library is found at runtime
+  export DYLD_LIBRARY_PATH="/path/to/your/custom-duckdb/build/release/src:$DYLD_LIBRARY_PATH"  # macOS
+  export LD_LIBRARY_PATH="/path/to/your/custom-duckdb/build/release/src:$LD_LIBRARY_PATH"      # Linux
+
+  Modified Makefile:
+  # Add custom DuckDB paths
+  CUSTOM_DUCKDB_PATH ?= /path/to/your/custom-duckdb
+  CFLAGS += -I$(CUSTOM_DUCKDB_PATH)/src/include
+  LDFLAGS += -L$(CUSTOM_DUCKDB_PATH)/build/release/src
+
+  5. Secret Registration in Extension Entry Point
+
+  In your extension's entry point, register the 'age' secret type:
+
+  pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
+      // Existing function registrations...
+
+      // Register 'age' secret type with DuckDB
+      let age_secret_type = CString::new("age")?;
+      let result = duckdb_register_secret_type(
+          con.as_raw(), // Assuming Connection has as_raw() method
+          age_secret_type.as_ptr(),
+          // Callback functions for age secret validation, etc.
+      );
+
+      if result != duckdb_state_DuckDBSuccess {
+          return Err("Failed to register age secret type".into());
+      }
+
+      Ok(())
+  }
+
+  6. Usage Pattern
+
+  Users would then be able to use secrets like this:
+
+  -- Create an age secret
+  CREATE SECRET my_age_key (
+      TYPE age,
+      KEY_DATA 'AGE-SECRET-KEY-1ABC123...'
+  );
+
+  -- Use secret in encryption functions
+  SELECT age_encrypt_with_secret('my_age_key', 'sensitive data') as encrypted;
+  SELECT age_decrypt_with_secret('my_age_key', encrypted_data) as decrypted;
+
+  7. Development Workflow
+
+  1. Build custom DuckDB with secret FFI support
+  2. Build custom Rust bindings that expose the new FFI functions
+  3. Update file-tools extension to use custom bindings
+  4. Test integration with secret creation and usage
+  5. Package together for distribution
+
+  8. Distribution Considerations
+
+  For distribution, you'd need to:
+  - Provide custom DuckDB binaries with your extension
+  - Document the secret management setup
+  - Ensure version compatibility between DuckDB core and extension
+  - Consider packaging both together (custom DuckDB + extension)
+
+  This approach would give you a much more robust and secure way to handle encryption keys compared to passing them as function parameters, integrating properly with DuckDB's built-in secret management system.
