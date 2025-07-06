@@ -2578,11 +2578,11 @@ impl VScalar for FileExistsScalar {
         let input_data = input_vector.as_slice_with_len::<duckdb_string_t>(input.len());
 
         let mut output_vector = output.flat_vector();
-        
+
         // First pass: identify which entries need to be NULL
         let mut null_entries = vec![false; input.len()];
         let mut bool_values = vec![false; input.len()];
-        
+
         for i in 0..input.len() {
             let mut filename_duck_string = input_data[i];
             let filename = DuckString::new(&mut filename_duck_string).as_str();
@@ -2607,14 +2607,14 @@ impl VScalar for FileExistsScalar {
                 }
             }
         }
-        
+
         // Set NULL entries first
         for i in 0..input.len() {
             if null_entries[i] {
                 output_vector.set_null(i);
             }
         }
-        
+
         // Then set boolean values for non-NULL entries
         let output_data = output_vector.as_mut_slice::<bool>();
         for i in 0..input.len() {
@@ -2649,11 +2649,11 @@ impl VScalar for PathExistsScalar {
         let input_data = input_vector.as_slice_with_len::<duckdb_string_t>(input.len());
 
         let mut output_vector = output.flat_vector();
-        
+
         // First pass: identify which entries need to be NULL
         let mut null_entries = vec![false; input.len()];
         let mut bool_values = vec![false; input.len()];
-        
+
         for i in 0..input.len() {
             let mut pathname_duck_string = input_data[i];
             let pathname = DuckString::new(&mut pathname_duck_string).as_str();
@@ -2674,14 +2674,14 @@ impl VScalar for PathExistsScalar {
                 }
             }
         }
-        
+
         // Set NULL entries first
         for i in 0..input.len() {
             if null_entries[i] {
                 output_vector.set_null(i);
             }
         }
-        
+
         // Then set boolean values for non-NULL entries
         let output_data = output_vector.as_mut_slice::<bool>();
         for i in 0..input.len() {
@@ -2700,7 +2700,6 @@ impl VScalar for PathExistsScalar {
         )]
     }
 }
-
 
 #[duckdb_entrypoint_c_api(ext_name = "file_tools")]
 /// # Safety
