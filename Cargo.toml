@@ -48,8 +48,5 @@ rayon = "1.8"
 flate2 = "1.0"
 lz4_flex = "0.11"
 zstd = "0.13"
-age = "0.11"
-secrecy = "0.10"
 
 [build-dependencies]
-cc = "1.0"

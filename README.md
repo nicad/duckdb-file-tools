@@ -3,7 +3,7 @@
 [![Build Status](https://github.com/nicad/duckdb-file-tools/workflows/CI/badge.svg)](https://github.com/nicad/duckdb-file-tools/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A DuckDB extension written in Rust that provides file system operations, metadata extraction, compression, and planned Age encryption support.
+A DuckDB extension written in Rust that provides file system operations, metadata extraction, and compression.
 
 Vibe coded so use at your discretion. Not tested much yet.
 
@@ -239,11 +239,7 @@ Runtime dependencies are statically linked into the extension.
 
 ## Planned Features
 
-🔐 **Age Encryption Support** (Coming Soon)
-- `age_encrypt()` / `age_decrypt()` functions
-- X25519 public key and passphrase-based encryption
-- Key generation utilities
-- Integration with existing file operations
+Additional file system utilities and performance improvements are under development.
 
 ## Contributing
 
@@ -275,4 +271,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Related Projects
 
 - [DuckDB](https://duckdb.org/) - An in-process SQL OLAP database management system
-- [rage](https://github.com/str4d/rage) - Rust implementation of the age encryption format

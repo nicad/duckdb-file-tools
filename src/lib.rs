@@ -2563,12 +2563,10 @@ fn get_inode(metadata: &fs::Metadata) -> u64 {
     }
 }
 
-// Age encryption scalar functions
+// Scalar file_exists function - checks if path exists and is a file
+struct FileExistsScalar;
 
-// age_keygen() function - generates a new X25519 key pair
-struct AgeKeygenScalar;
-
-impl VScalar for AgeKeygenScalar {
+impl VScalar for FileExistsScalar {
     type State = ();
 
     unsafe fn invoke(
@@ -2576,87 +2574,53 @@ impl VScalar for AgeKeygenScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let struct_vector = output.struct_vector();
+        let input_vector = input.flat_vector(0);
+        let input_data = input_vector.as_slice_with_len::<duckdb_string_t>(input.len());
 
-        // Get child vectors for public and private keys
-        let public_key_vector = struct_vector.child(0, input.len());
-        let private_key_vector = struct_vector.child(1, input.len());
-
+        let mut output_vector = output.flat_vector();
+        
+        // First pass: identify which entries need to be NULL
+        let mut null_entries = vec![false; input.len()];
+        let mut bool_values = vec![false; input.len()];
+        
         for i in 0..input.len() {
-            // Generate a new X25519 identity
-            let identity = x25519::Identity::generate();
-            let public_key = identity.to_public();
+            let mut filename_duck_string = input_data[i];
+            let filename = DuckString::new(&mut filename_duck_string).as_str();
 
-            // Convert to string representations
-            let public_key_str = public_key.to_string();
-            let private_key_str = identity.to_string();
-
-            // Insert into struct fields
-            public_key_vector.insert(i, public_key_str.as_str());
-            private_key_vector.insert(i, private_key_str.expose_secret());
+            match std::fs::metadata(&*filename) {
+                Ok(metadata) => {
+                    if metadata.is_file() {
+                        bool_values[i] = true;
+                    } else {
+                        // Path exists but is not a file (directory, symlink, etc.) -> NULL
+                        null_entries[i] = true;
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        // Path doesn't exist -> FALSE
+                        bool_values[i] = false;
+                    } else {
+                        // Other errors (permission denied, etc.) -> NULL
+                        null_entries[i] = true;
+                    }
+                }
+            }
         }
-
-        Ok(())
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        // Create STRUCT return type with public_key and private_key fields
-        let struct_type = LogicalTypeHandle::struct_type(&[
-            (
-                "public_key",
-                LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            ),
-            (
-                "private_key",
-                LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            ),
-        ]);
-
-        // Use a dummy parameter since DuckDB may not support zero-parameter scalar functions
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeHandle::from(LogicalTypeId::Integer)],
-            struct_type,
-        )]
-    }
-}
-
-// age_keygen_secret(name) function - generates key pair and returns CREATE SECRET SQL
-struct AgeKeygenSecretScalar;
-
-impl VScalar for AgeKeygenSecretScalar {
-    type State = ();
-
-    unsafe fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let name_vector = input.flat_vector(0);
-        let name_slice = name_vector.as_slice_with_len::<duckdb_string_t>(input.len());
-
-        let output_vector = output.flat_vector();
-
+        
+        // Set NULL entries first
         for i in 0..input.len() {
-            let mut name_duck_string = name_slice[i];
-            let secret_name = DuckString::new(&mut name_duck_string).as_str();
-
-            // Generate a new X25519 identity
-            let identity = x25519::Identity::generate();
-            let public_key = identity.to_public();
-
-            // Convert to string representations
-            let public_key_str = public_key.to_string();
-            let private_key_str = identity.to_string();
-
-            // Create the SQL statement
-            let create_sql = format!(
-                "CREATE SECRET {} (TYPE age, PUBLIC_KEY '{}', PRIVATE_KEY '{}');",
-                secret_name,
-                public_key_str,
-                private_key_str.expose_secret()
-            );
-
-            output_vector.insert(i, create_sql.as_str());
+            if null_entries[i] {
+                output_vector.set_null(i);
+            }
+        }
+        
+        // Then set boolean values for non-NULL entries
+        let output_data = output_vector.as_mut_slice::<bool>();
+        for i in 0..input.len() {
+            if !null_entries[i] {
+                output_data[i] = bool_values[i];
+            }
         }
 
         Ok(())
@@ -2665,62 +2629,15 @@ impl VScalar for AgeKeygenSecretScalar {
     fn signatures() -> Vec<ScalarFunctionSignature> {
         vec![ScalarFunctionSignature::exact(
             vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Boolean),
         )]
     }
 }
 
-// Helper function to extract string list from DuckDB ListVector
-// This will help us discover the correct API through compiler errors
-fn extract_string_list(
-    list_vector: &duckdb::core::ListVector,
-    _row_idx: usize,
-) -> Option<Vec<String>> {
-    // Try to access the list entries using unsafe FFI
-    // DuckDB stores list entries as an array of duckdb_list_entry structs
+// Scalar path_exists function - checks if path exists (any type)
+struct PathExistsScalar;
 
-    // This is experimental - try to access the internal list entries
-    // We need to get the list entry data somehow
-
-    // For now, let's implement a simplified version that just returns the first few strings
-    // from the child vector, which might work for simple test cases
-
-    let total_len = list_vector.len();
-    if total_len == 0 {
-        return Some(Vec::new());
-    }
-
-    // Get the child vector containing all string values
-    let child_vector = list_vector.child(total_len);
-
-    // Try to read strings from child vector
-    let child_data = child_vector.as_slice_with_len::<duckdb_string_t>(total_len);
-
-    // For testing: return at most 2 strings from the child vector
-    // This is a hack but will help us test if the basic reading works
-    let mut result = Vec::new();
-    let count = std::cmp::min(total_len, 2);
-
-    for i in 0..count {
-        let mut string_duck = child_data[i];
-        let mut duck_string = DuckString::new(&mut string_duck);
-        result.push(duck_string.as_str().to_string());
-    }
-
-    Some(result)
-}
-
-// Helper to check if string is likely a secret name vs an age key
-fn is_secret_name(key_str: &str) -> bool {
-    // Age public keys start with "age1"
-    // Age private keys start with "AGE-SECRET-KEY-1"
-    !key_str.starts_with("age1") && !key_str.starts_with("AGE-SECRET-KEY-1")
-}
-
-// age_encrypt() function - single VARCHAR with comma-separated recipients (calls age_encrypt_multi internally)
-struct AgeEncryptSingleScalar;
-
-impl VScalar for AgeEncryptSingleScalar {
+impl VScalar for PathExistsScalar {
     type State = ();
 
     unsafe fn invoke(
@@ -2728,349 +2645,48 @@ impl VScalar for AgeEncryptSingleScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let data_vector = input.flat_vector(0);
-        let recipient_vector = input.flat_vector(1);
-
-        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
-        let recipient_slice = recipient_vector.as_slice_with_len::<duckdb_string_t>(input.len());
+        let input_vector = input.flat_vector(0);
+        let input_data = input_vector.as_slice_with_len::<duckdb_string_t>(input.len());
 
         let mut output_vector = output.flat_vector();
-
+        
+        // First pass: identify which entries need to be NULL
+        let mut null_entries = vec![false; input.len()];
+        let mut bool_values = vec![false; input.len()];
+        
         for i in 0..input.len() {
-            let mut data_duck_string = data_slice[i];
-            let mut data_str = DuckString::new(&mut data_duck_string);
-            let data_bytes = data_str.as_bytes();
+            let mut pathname_duck_string = input_data[i];
+            let pathname = DuckString::new(&mut pathname_duck_string).as_str();
 
-            let mut recipients_duck_string = recipient_slice[i];
-            let recipients_str = DuckString::new(&mut recipients_duck_string).as_str();
-
-            // TODO: If this is a secret name (not starting with "age1"),
-            // we would need to look it up in the secrets manager.
-            // This requires FFI to DuckDB's C++ API which is not yet implemented.
-            // For now, we'll add a comment about this limitation.
-
-            // Parse comma-separated recipients (handles both single and multiple)
-            let recipients: Vec<String> = recipients_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            // Check if any recipient might be a secret name
-            let has_secret_names = recipients.iter().any(|r| is_secret_name(r));
-            if has_secret_names {
-                // TODO: Implement secret manager lookup via FFI
-                // For now, return an error message
-                output_vector.set_null(i);
-                continue;
-            }
-
-            // Call the multi-recipient internal function
-            match age_encrypt_multi(data_bytes, &recipients) {
-                Ok(encrypted_data) => {
-                    output_vector.insert(i, encrypted_data.as_slice());
-                }
-                Err(_e) => {
-                    // Set NULL on error (consistent error handling)
-                    output_vector.set_null(i);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![
-                LogicalTypeHandle::from(LogicalTypeId::Blob),
-                LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            ],
-            LogicalTypeHandle::from(LogicalTypeId::Blob),
-        )]
-    }
-}
-
-// age_encrypt_multi() function - multiple recipients as VARCHAR[] array
-struct AgeEncryptMultiScalar;
-
-impl VScalar for AgeEncryptMultiScalar {
-    type State = ();
-
-    unsafe fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let data_vector = input.flat_vector(0);
-        let recipients_vector = input.list_vector(1); // VARCHAR[] list
-
-        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
-        let mut output_vector = output.flat_vector();
-
-        // Let's try to discover the correct API by attempting different method names
-        // The compiler will tell us what methods are available
-
-        for i in 0..input.len() {
-            let mut data_duck_string = data_slice[i];
-            let mut data_str = DuckString::new(&mut data_duck_string);
-            let data_bytes = data_str.as_bytes();
-
-            // Try to get recipients from the list vector
-            // Let's start with a simple approach and see what methods are available
-            let recipients = match extract_string_list(&recipients_vector, i) {
-                Some(list) => list,
-                None => {
-                    output_vector.set_null(i);
-                    continue;
-                }
-            };
-
-            // Call the multi-recipient function with extracted array
-            match age_encrypt_multi(data_bytes, &recipients) {
-                Ok(encrypted) => {
-                    output_vector.insert(i, encrypted.as_slice());
-                }
-                Err(_e) => {
-                    output_vector.set_null(i);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        let varchar_type = LogicalTypeHandle::from(LogicalTypeId::Varchar);
-        let list_varchar_type = LogicalTypeHandle::list(&varchar_type);
-
-        vec![ScalarFunctionSignature::exact(
-            vec![
-                LogicalTypeHandle::from(LogicalTypeId::Blob),
-                list_varchar_type, // VARCHAR[] array of recipients
-            ],
-            LogicalTypeHandle::from(LogicalTypeId::Blob),
-        )]
-    }
-}
-
-// age_encrypt_passphrase() function
-struct AgeEncryptPassphraseScalar;
-
-impl VScalar for AgeEncryptPassphraseScalar {
-    type State = ();
-
-    unsafe fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let data_vector = input.flat_vector(0);
-        let passphrase_vector = input.flat_vector(1);
-
-        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
-        let passphrase_slice = passphrase_vector.as_slice_with_len::<duckdb_string_t>(input.len());
-
-        let output_vector = output.flat_vector();
-
-        for i in 0..input.len() {
-            let mut data_duck_string = data_slice[i];
-            let mut data_str = DuckString::new(&mut data_duck_string);
-            let data_bytes = data_str.as_bytes();
-
-            let mut passphrase_duck_string = passphrase_slice[i];
-            let passphrase_str = DuckString::new(&mut passphrase_duck_string).as_str();
-
-            match age_encrypt_passphrase(data_bytes, &passphrase_str) {
-                Ok(encrypted_data) => {
-                    output_vector.insert(i, encrypted_data.as_slice());
+            match std::fs::metadata(&*pathname) {
+                Ok(_) => {
+                    // Path exists (any type) -> TRUE
+                    bool_values[i] = true;
                 }
                 Err(e) => {
-                    return Err(e);
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        // Path doesn't exist -> FALSE
+                        bool_values[i] = false;
+                    } else {
+                        // Other errors (permission denied, etc.) -> NULL
+                        null_entries[i] = true;
+                    }
                 }
             }
         }
-
-        Ok(())
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![
-                LogicalTypeHandle::from(LogicalTypeId::Blob),
-                LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            ],
-            LogicalTypeHandle::from(LogicalTypeId::Blob),
-        )]
-    }
-}
-
-// age_decrypt() function - single VARCHAR with comma-separated identities (calls age_decrypt_multi internally)
-struct AgeDecryptSingleScalar;
-
-impl VScalar for AgeDecryptSingleScalar {
-    type State = ();
-
-    unsafe fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let data_vector = input.flat_vector(0);
-        let identity_vector = input.flat_vector(1);
-
-        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
-        let identity_slice = identity_vector.as_slice_with_len::<duckdb_string_t>(input.len());
-
-        let mut output_vector = output.flat_vector();
-
+        
+        // Set NULL entries first
         for i in 0..input.len() {
-            let mut data_duck_string = data_slice[i];
-            let mut data_str = DuckString::new(&mut data_duck_string);
-            let data_bytes = data_str.as_bytes();
-
-            let mut identities_duck_string = identity_slice[i];
-            let identities_str = DuckString::new(&mut identities_duck_string).as_str();
-
-            // TODO: If this is a secret name (not starting with "AGE-SECRET-KEY-1"),
-            // we would need to look it up in the secrets manager.
-            // This requires FFI to DuckDB's C++ API which is not yet implemented.
-
-            // Parse comma-separated identities (handles both single and multiple)
-            let identities: Vec<String> = identities_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            // Check if any identity might be a secret name
-            let has_secret_names = identities.iter().any(|i| is_secret_name(i));
-            if has_secret_names {
-                // TODO: Implement secret manager lookup via FFI
-                // For now, return an error message
+            if null_entries[i] {
                 output_vector.set_null(i);
-                continue;
-            }
-
-            // Call the multi-identity internal function
-            match age_decrypt_multi(data_bytes, &identities) {
-                Ok(decrypted_data) => {
-                    output_vector.insert(i, decrypted_data.as_slice());
-                }
-                Err(_e) => {
-                    // Set NULL on error (consistent error handling)
-                    output_vector.set_null(i);
-                }
             }
         }
-
-        Ok(())
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![
-                LogicalTypeHandle::from(LogicalTypeId::Blob),
-                LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            ],
-            LogicalTypeHandle::from(LogicalTypeId::Blob),
-        )]
-    }
-}
-
-// age_decrypt_multi() function - multiple identities as VARCHAR[] array
-struct AgeDecryptMultiScalar;
-
-impl VScalar for AgeDecryptMultiScalar {
-    type State = ();
-
-    unsafe fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let _data_vector = input.flat_vector(0);
-        let _identities_vector = input.list_vector(1); // VARCHAR[] list
-
-        let _data_slice = _data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
-        let mut output_vector = output.flat_vector();
-
+        
+        // Then set boolean values for non-NULL entries
+        let output_data = output_vector.as_mut_slice::<bool>();
         for i in 0..input.len() {
-            let mut data_duck_string = _data_slice[i];
-            let mut data_str = DuckString::new(&mut data_duck_string);
-            let data_bytes = data_str.as_bytes();
-
-            // Try to get identities from the list vector
-            let identities = match extract_string_list(&_identities_vector, i) {
-                Some(list) => list,
-                None => {
-                    output_vector.set_null(i);
-                    continue;
-                }
-            };
-
-            // Call the multi-identity function with extracted array
-            match age_decrypt_multi(data_bytes, &identities) {
-                Ok(decrypted_data) => {
-                    output_vector.insert(i, decrypted_data.as_slice());
-                }
-                Err(_e) => {
-                    output_vector.set_null(i);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        let varchar_type = LogicalTypeHandle::from(LogicalTypeId::Varchar);
-        let list_varchar_type = LogicalTypeHandle::list(&varchar_type);
-
-        vec![ScalarFunctionSignature::exact(
-            vec![
-                LogicalTypeHandle::from(LogicalTypeId::Blob),
-                list_varchar_type, // VARCHAR[] array of identities
-            ],
-            LogicalTypeHandle::from(LogicalTypeId::Blob),
-        )]
-    }
-}
-
-// age_decrypt_passphrase() function
-struct AgeDecryptPassphraseScalar;
-
-impl VScalar for AgeDecryptPassphraseScalar {
-    type State = ();
-
-    unsafe fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let data_vector = input.flat_vector(0);
-        let passphrase_vector = input.flat_vector(1);
-
-        let data_slice = data_vector.as_slice_with_len::<duckdb_string_t>(input.len());
-        let passphrase_slice = passphrase_vector.as_slice_with_len::<duckdb_string_t>(input.len());
-
-        let output_vector = output.flat_vector();
-
-        for i in 0..input.len() {
-            let mut data_duck_string = data_slice[i];
-            let mut data_str = DuckString::new(&mut data_duck_string);
-            let data_bytes = data_str.as_bytes();
-
-            let mut passphrase_duck_string = passphrase_slice[i];
-            let passphrase_str = DuckString::new(&mut passphrase_duck_string).as_str();
-
-            match age_decrypt_passphrase(data_bytes, &passphrase_str) {
-                Ok(decrypted_data) => {
-                    output_vector.insert(i, decrypted_data.as_slice());
-                }
-                Err(e) => {
-                    return Err(e);
-                }
+            if !null_entries[i] {
+                output_data[i] = bool_values[i];
             }
         }
 
@@ -3079,166 +2695,12 @@ impl VScalar for AgeDecryptPassphraseScalar {
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
         vec![ScalarFunctionSignature::exact(
-            vec![
-                LogicalTypeHandle::from(LogicalTypeId::Blob),
-                LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            ],
-            LogicalTypeHandle::from(LogicalTypeId::Blob),
+            vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
+            LogicalTypeHandle::from(LogicalTypeId::Boolean),
         )]
     }
 }
 
-// Age encryption/decryption implementation functions
-
-#[allow(dead_code)]
-fn age_encrypt_single(
-    data: &[u8],
-    recipient_str: &str,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // Parse the recipient public key
-    let recipient: x25519::Recipient = recipient_str
-        .parse()
-        .map_err(|e| format!("Invalid age recipient: {}", e))?;
-
-    // Encrypt using the simple API
-    let encrypted =
-        age::encrypt(&recipient, data).map_err(|e| format!("Age encryption failed: {}", e))?;
-
-    Ok(encrypted)
-}
-
-fn age_encrypt_multi(
-    data: &[u8],
-    recipient_strs: &[String],
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if recipient_strs.is_empty() {
-        return Err("No recipients provided".into());
-    }
-
-    // Parse all recipient public keys
-    let mut recipients = Vec::new();
-    for recipient_str in recipient_strs {
-        let recipient: x25519::Recipient = recipient_str
-            .parse()
-            .map_err(|e| format!("Invalid age recipient '{}': {}", recipient_str, e))?;
-        recipients.push(Box::new(recipient) as Box<dyn age::Recipient>);
-    }
-
-    // Create encryptor with multiple recipients (pass iterator of references)
-    let encryptor = age::Encryptor::with_recipients(recipients.iter().map(|r| r.as_ref()))
-        .map_err(|e| format!("Failed to create age encryptor: {}", e))?;
-
-    // Encrypt the data
-    let mut encrypted = Vec::new();
-    let mut writer = encryptor
-        .wrap_output(&mut encrypted)
-        .map_err(|e| format!("Failed to create age writer: {}", e))?;
-
-    std::io::Write::write_all(&mut writer, data)
-        .map_err(|e| format!("Failed to write data for encryption: {}", e))?;
-
-    writer
-        .finish()
-        .map_err(|e| format!("Failed to finalize age encryption: {}", e))?;
-
-    Ok(encrypted)
-}
-
-fn age_encrypt_passphrase(
-    data: &[u8],
-    passphrase: &str,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // Create scrypt recipient with passphrase
-    let recipient = scrypt::Recipient::new(SecretString::from(passphrase.to_string()));
-
-    // Encrypt using the simple API
-    let encrypted = age::encrypt(&recipient, data)
-        .map_err(|e| format!("Age passphrase encryption failed: {}", e))?;
-
-    Ok(encrypted)
-}
-
-#[allow(dead_code)]
-fn age_decrypt_single(
-    data: &[u8],
-    identity_str: &str,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // Parse the identity private key
-    let identity: x25519::Identity = identity_str
-        .parse()
-        .map_err(|e| format!("Invalid age identity: {}", e))?;
-
-    // Decrypt using the simple API
-    let decrypted =
-        age::decrypt(&identity, data).map_err(|e| format!("Age decryption failed: {}", e))?;
-
-    Ok(decrypted)
-}
-
-fn age_decrypt_multi(
-    data: &[u8],
-    identity_strs: &[String],
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if identity_strs.is_empty() {
-        return Err("No identities provided".into());
-    }
-
-    // Parse all identity private keys
-    let mut identities = Vec::new();
-    for identity_str in identity_strs {
-        let identity: x25519::Identity = identity_str
-            .parse()
-            .map_err(|e| format!("Invalid age identity '{}': {}", identity_str, e))?;
-        identities.push(Box::new(identity) as Box<dyn age::Identity>);
-    }
-
-    // Try to decrypt with any of the provided identities
-    let decryptor =
-        age::Decryptor::new(data).map_err(|e| format!("Failed to create age decryptor: {}", e))?;
-
-    let mut decrypted = Vec::new();
-    let mut reader = decryptor
-        .decrypt(identities.iter().map(|i| i.as_ref()))
-        .map_err(|e| format!("Age multi-identity decryption failed: {}", e))?;
-
-    std::io::Read::read_to_end(&mut reader, &mut decrypted)
-        .map_err(|e| format!("Failed to read decrypted data: {}", e))?;
-
-    Ok(decrypted)
-}
-
-fn age_decrypt_passphrase(
-    data: &[u8],
-    passphrase: &str,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // Create scrypt identity with passphrase
-    let identity = scrypt::Identity::new(SecretString::from(passphrase.to_string()));
-
-    // Decrypt using the simple API
-    let decrypted = age::decrypt(&identity, data)
-        .map_err(|e| format!("Age passphrase decryption failed: {}", e))?;
-
-    Ok(decrypted)
-}
-
-// Note: Secret type registration is not available through Rust FFI bindings.
-// To register the "age" secret type, you would need C++ glue code like:
-//
-// void FileToolsExtension::Load(DuckDB &db) {
-//     SecretType age_secret_type;
-//     age_secret_type.name = "age";
-//     age_secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
-//     age_secret_type.default_provider = "config";
-//     age_secret_type.extension = "file_tools";
-//     ExtensionUtil::RegisterSecretType(db.GetDatabaseInstance(), age_secret_type);
-//
-//     CreateSecretFunction create_age_secret = {"age", "config", CreateAgeSecretFromConfig};
-//     create_age_secret.named_parameters["public_key"] = LogicalType::VARCHAR;
-//     create_age_secret.named_parameters["private_key"] = LogicalType::VARCHAR;
-//     ExtensionUtil::RegisterFunction(db.GetDatabaseInstance(), create_age_secret);
-// }
-//
-// For now, use age_keygen_secret() to generate the CREATE SECRET SQL and execute manually.
 
 #[duckdb_entrypoint_c_api(ext_name = "file_tools")]
 /// # Safety
@@ -3293,6 +2755,11 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_scalar_function::<CompressLz4Scalar>("compress_lz4")
         .expect("Failed to register compress_lz4 scalar function");
 
+    con.register_scalar_function::<FileExistsScalar>("file_exists")
+        .expect("Failed to register file_exists scalar function");
+
+    con.register_scalar_function::<PathExistsScalar>("path_exists")
+        .expect("Failed to register path_exists scalar function");
 
     Ok(())
 }
